@@ -17,6 +17,10 @@ This repo now includes a dev-first container setup that keeps editing/debugging 
   - `/workspace/vse-stitcher`
   - `/workspace/vse-text`
 - Docker daemon (Docker Desktop) must be running before `docker compose` commands.
+- Image install now includes:
+  - pinned Blender runtime (`BLENDER_VERSION`, default `4.2.2`)
+  - `ffmpeg`
+  - bundled copies of `script-orchestrator-sync`, `vse-stitcher`, and `vse-text`
 
 From `script-orchestrator-sync/`:
 
@@ -40,11 +44,13 @@ Credential/default path behavior in compose:
   `/workspace/.config/gcloud/application_default_credentials.json`
 - override with env var if needed:
   `GOOGLE_APPLICATION_CREDENTIALS=/path/in/container/key.json`
+- Optional Blender pin override during image build:
+  `BLENDER_VERSION=4.2.2 docker compose build app`
 
 VM-style runtime (no reload, same Dockerfile):
 
 ```bash
-docker build -t script-orchestrator-sync:vm .
+docker build -t script-orchestrator-sync:vm -f Dockerfile ..
 docker run --rm -p 8000:8000 \
   -e CONTROL_SHEET_ID=<your_control_sheet_id> \
   -e SHEETS_JSON_BASE_URL=https://YOUR-SHEETS-JSON-GATEWAY.a.run.app \

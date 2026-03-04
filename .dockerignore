@@ -1,0 +1,11 @@
+.git
+**/.DS_Store
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/.venv_local
+script-orchestrator-sync/work
+vse-text/out*.mp4
+vse-stitcher/out*.mp4
+vse-text/*.log
+vse-stitcher/*.log
