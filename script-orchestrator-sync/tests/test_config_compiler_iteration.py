@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+
+_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "compile_config_to_render_job.py"
+_SPEC = importlib.util.spec_from_file_location("compile_config_to_render_job", _SCRIPT_PATH)
+if _SPEC is None or _SPEC.loader is None:
+    raise RuntimeError(f"Unable to import compile script from {_SCRIPT_PATH}")
+compiler = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(compiler)
+
+
+def test_required_run_count_ceil_division() -> None:
+    assert compiler._required_run_count(12, 2) == 6
+    assert compiler._required_run_count(13, 2) == 7
+    assert compiler._required_run_count(0, 2) == 1
+
+
+def test_render_job_id_for_iteration_suffixing() -> None:
+    assert compiler._render_job_id_for_iteration("cfg_abc", 1, 1) == "cfg_abc"
+    assert compiler._render_job_id_for_iteration("cfg_abc", 1, 6) == "cfg_abc_r01"
+    assert compiler._render_job_id_for_iteration("cfg_abc", 6, 6) == "cfg_abc_r06"
+
+
+def test_normalize_text_preset_name() -> None:
+    assert compiler._normalize_text_preset_name("text_preset_brat_words_manual.py") == "brat_words_manual"
+    assert compiler._normalize_text_preset_name("brat_words_manual") == "brat_words_manual"
+    assert compiler._normalize_text_preset_name("") == ""
+
+
+def test_read_preset_rows_from_sheet1_layout() -> None:
+    class _FakeGateway:
+        def read(self, _sheet_id: str, _ranges: list[str]):
+            return {
+                "valueRanges": [
+                    {
+                        "values": [
+                            ["FF Presets", "Performance Presets", "Lyric Presets", "Copy Presets"],
+                            ["1p1u1f1c1m1t", "", "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007.py", ""],
+                            [],
+                            ["2p2u2c2t2m2f", "", "", ""],
+                        ]
+                    }
+                ]
+            }
+
+    rows = compiler._read_preset_rows(_FakeGateway(), "sheet_id", tab="Sheet1")
+    assert rows == [
+        {
+            "stitch_preset": "1p1u1f1c1m1t",
+            "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+        },
+        {
+            "stitch_preset": "2p2u2c2t2m2f",
+            "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+        },
+    ]
+
+
+def test_non_multiple_video_count_trims_last_iteration() -> None:
+    cfg = {
+        "Cut Clips?": "TRUE",
+        "Clip 1": "TRUE",
+        "Clip 1 Start": "00:00:00:00",
+        "Clip 1 End": "00:00:02:00",
+        "Clip 2": "TRUE",
+        "Clip 2 Start": "00:00:02:00",
+        "Clip 2 End": "00:00:04:00",
+        "Clip 3": "TRUE",
+        "Clip 3 Start": "00:00:04:00",
+        "Clip 3 End": "00:00:06:00",
+    }
+
+    base_cuts = compiler.build_cuts_from_config(cfg, naming_convention="Example_000", start_index=1)
+    clip_count = len(base_cuts)
+    assert clip_count == 3
+
+    number_of_videos = 17
+    required_runs = compiler._required_run_count(number_of_videos, clip_count)
+    assert required_runs == 6
+
+    run_cut_counts: list[int] = []
+    for i in range(required_runs):
+        run_cuts = compiler.build_cuts_from_config(
+            cfg,
+            naming_convention="Example_000",
+            start_index=(i * clip_count) + 1,
+        )
+        remaining = max(0, number_of_videos - (i * clip_count))
+        if remaining > 0 and len(run_cuts) > remaining:
+            run_cuts = run_cuts[:remaining]
+        run_cut_counts.append(len(run_cuts))
+
+    assert run_cut_counts == [3, 3, 3, 3, 3, 2]
+    assert sum(run_cut_counts) == number_of_videos
+
+
+def test_collection_pool_for_run_alternates_across_1_to_4() -> None:
+    pools = [
+        {"collection_num": "1"},
+        {"collection_num": "2"},
+        {"collection_num": "3"},
+        {"collection_num": "4"},
+    ]
+    seq = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(10)]
+    assert seq == ["1", "2", "3", "4", "1", "2", "3", "4", "1", "2"]
+
+
+def test_collection_alternation_is_per_full_length_run_not_per_cut() -> None:
+    cfg = {
+        "Cut Clips?": "TRUE",
+        "Clip 1": "TRUE",
+        "Clip 1 Start": "00:00:00:00",
+        "Clip 1 End": "00:00:02:00",
+        "Clip 2": "TRUE",
+        "Clip 2 Start": "00:00:02:00",
+        "Clip 2 End": "00:00:04:00",
+    }
+    clip_count = len(compiler.build_cuts_from_config(cfg, naming_convention="Example_000", start_index=1))
+    assert clip_count == 2
+
+    # 17 requested short videos with 2 cuts/run => 9 full-length runs.
+    required_runs = compiler._required_run_count(17, clip_count)
+    assert required_runs == 9
+    pools = [
+        {"collection_num": "1"},
+        {"collection_num": "2"},
+        {"collection_num": "3"},
+        {"collection_num": "4"},
+    ]
+    run_sequence = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(required_runs)]
+    assert run_sequence == ["1", "2", "3", "4", "1", "2", "3", "4", "1"]
+
+
+def test_collection_pool_for_run_errors_on_invalid_input() -> None:
+    with pytest.raises(RuntimeError, match=r"No collection pools available"):
+        compiler._collection_pool_for_run([], 0)
+    with pytest.raises(ValueError, match=r"run_index must be >= 0"):
+        compiler._collection_pool_for_run([{"collection_num": "1"}], -1)

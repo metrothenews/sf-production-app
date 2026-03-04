@@ -1,0 +1,535 @@
+1
+01:00:09,083 --> 01:00:10,125
+<b>i feel bad</b>
+
+2
+01:00:12,458 --> 01:00:13,500
+<b>i feel bad</b>
+
+3
+01:00:14,833 --> 01:00:15,875
+<b>oh look</b>
+<b>at you</b>
+
+4
+01:00:16,250 --> 01:00:17,416
+<b>you texted me</b>
+<b>at ten</b>
+
+5
+01:00:17,416 --> 01:00:19,166
+<b>and i couldn't</b>
+<b>give a damn</b>
+
+6
+01:00:19,166 --> 01:00:20,916
+<b>even if i tried</b>
+
+7
+01:00:21,541 --> 01:00:23,083
+<b>it's what you do</b>
+
+8
+01:00:23,166 --> 01:00:24,333
+<b>even at my worst</b>
+
+9
+01:00:24,416 --> 01:00:26,208
+<b>you make me look</b>
+<b>like the man</b>
+
+10
+01:00:26,625 --> 01:00:28,666
+<b>and every day</b>
+<b>that i wake up</b>
+
+11
+01:00:28,666 --> 01:00:30,208
+<b>i just gotta</b>
+<b>thank God</b>
+
+12
+01:00:30,208 --> 01:00:31,208
+<b>that i'm not you</b>
+
+13
+01:00:31,208 --> 01:00:33,041
+<b>but still i'm</b>
+<b>feelin' off</b>
+
+14
+01:00:33,208 --> 01:00:34,416
+<b>i feel bad</b>
+
+15
+01:00:35,541 --> 01:00:38,625
+<b>oh i feel bad</b>
+
+16
+01:00:38,916 --> 01:00:40,125
+<b>ooh</b>
+
+17
+01:00:40,125 --> 01:00:41,458
+<b>it isn't my fault</b>
+
+18
+01:00:41,458 --> 01:00:43,541
+<b>you been f------ up</b>
+<b>so much</b>
+
+19
+01:00:43,541 --> 01:00:44,875
+<b>easier falls</b>
+
+20
+01:00:44,875 --> 01:00:46,875
+<b>have been</b>
+<b>broken before but</b>
+
+21
+01:00:46,875 --> 01:00:48,083
+<b>i feel bad</b>
+
+22
+01:00:50,250 --> 01:00:51,458
+<b>i feel bad</b>
+
+23
+01:00:52,750 --> 01:00:55,000
+<b>i feel bad</b>
+
+24
+01:00:55,916 --> 01:00:56,958
+<b>keep it a buck</b>
+
+25
+01:00:57,333 --> 01:00:58,500
+<b>i guess the </b>
+<b>truth is i</b>
+
+26
+01:00:58,500 --> 01:01:00,250
+<b>never really</b>
+<b>gave a f***</b>
+
+27
+01:01:00,250 --> 01:01:02,000
+<b>even when i tried</b>
+
+28
+01:01:02,625 --> 01:01:04,083
+<b>i know what's up</b>
+
+29
+01:01:04,083 --> 01:01:05,833
+<b>it finally</b>
+<b>caught up to you</b>
+
+30
+01:01:05,916 --> 01:01:07,666
+<b>that you're </b>
+<b>outta luck</b>
+
+31
+01:01:07,791 --> 01:01:09,833
+<b>and every day</b>
+<b>that i wake up</b>
+
+32
+01:01:09,833 --> 01:01:11,375
+<b>i just gotta</b>
+<b>thank God</b>
+
+33
+01:01:11,375 --> 01:01:12,375
+<b>that i'm not you</b>
+
+34
+01:01:12,375 --> 01:01:14,208
+<b>but still i'm</b>
+<b>feelin' off</b>
+
+35
+01:01:14,333 --> 01:01:16,375
+<b>and every day</b>
+<b>that i wake up</b>
+
+36
+01:01:16,375 --> 01:01:17,916
+<b>i'm just crossing </b>
+<b>my fingers</b>
+
+37
+01:01:17,916 --> 01:01:18,916
+<b>that i see you</b>
+
+38
+01:01:18,916 --> 01:01:20,750
+<b>just so i can </b>
+<b>piss you off</b>
+
+39
+01:01:21,166 --> 01:01:22,375
+<b>i feel bad</b>
+
+40
+01:01:23,500 --> 01:01:26,583
+<b>oh i feel bad</b>
+
+41
+01:01:26,875 --> 01:01:28,083
+<b>ooh</b>
+
+42
+01:01:28,083 --> 01:01:29,416
+<b>it isn't my fault</b>
+
+43
+01:01:29,416 --> 01:01:31,500
+<b>you been f------ up</b>
+<b>so much</b>
+
+44
+01:01:31,500 --> 01:01:32,833
+<b>easier falls</b>
+
+45
+01:01:32,833 --> 01:01:34,833
+<b>have been</b>
+<b>broken before but</b>
+
+46
+01:01:34,833 --> 01:01:36,041
+<b>i feel bad</b>
+
+47
+01:01:37,791 --> 01:01:40,875
+<b>i said i feel bad</b>
+
+48
+01:01:41,166 --> 01:01:43,125
+<b>and like what</b>
+<b>do you know</b>
+
+49
+01:01:43,125 --> 01:01:44,416
+<b>climb up</b>
+<b>another notch</b>
+
+50
+01:01:44,416 --> 01:01:46,583
+<b>hey i guess</b>
+<b>you reap what you sew</b>
+
+51
+01:01:46,583 --> 01:01:47,916
+<b>but it's so</b>
+<b>hard to watch</b>
+
+52
+01:01:47,916 --> 01:01:48,500
+<b>lately</b>
+
+53
+01:01:48,500 --> 01:01:49,041
+<b>i feel bad</b>
+
+54
+01:01:49,041 --> 01:01:49,583
+<b>yeah</b>
+
+55
+01:01:49,583 --> 01:01:51,541
+<b>i'm tryna hand</b>
+<b>you this wisdom, </b>
+<b>yeah</b>
+
+56
+01:01:51,541 --> 01:01:52,958
+<b>but you don't</b>
+<b>get it, yeah</b>
+
+57
+01:01:52,958 --> 01:01:54,166
+<b>i guess it is</b>
+<b>what it is</b>
+
+58
+01:01:54,166 --> 01:01:55,916
+<b>and i'm trying</b>
+<b>not to be the next</b>
+<b>victim, yeah</b>
+
+59
+01:01:55,916 --> 01:01:57,125
+<b>you're on your</b>
+<b>Kardashian vibe</b>
+
+60
+01:01:57,125 --> 01:01:58,416
+<b>and you postin'</b>
+<b>these pictures </b>
+<b>online</b>
+
+61
+01:01:58,416 --> 01:01:59,583
+<b>and i'm mindin'</b>
+<b>my business</b>
+
+62
+01:01:59,583 --> 01:02:00,708
+<b>but you poppin'</b>
+<b>your a-- out for </b>
+<b>clicks</b>
+
+63
+01:02:00,708 --> 01:02:01,958
+<b>and don't get how</b>
+<b>pathetic it is</b>
+
+64
+01:02:01,958 --> 01:02:03,125
+<b>but i'm peepin'</b>
+<b>this vision, yeah</b>
+
+65
+01:02:03,125 --> 01:02:03,583
+<b>yeah</b>
+
+66
+01:02:03,583 --> 01:02:05,125
+<b>tryna get after</b>
+<b>these M's like </b>
+<b>Jadakiss</b>
+
+67
+01:02:05,125 --> 01:02:06,500
+<b>you takin' shots</b>
+<b>at me, well </b>
+<b>way to miss</b>
+
+68
+01:02:06,500 --> 01:02:08,041
+<b>this pop-off</b>
+<b>boutta be </b>
+<b>historical</b>
+
+69
+01:02:08,041 --> 01:02:09,625
+<b>like a S&W</b>
+<b>sat inside the</b>
+<b>Smithsonian</b>
+
+70
+01:02:09,625 --> 01:02:10,500
+<b>in the ------ </b>
+<b>section</b>
+
+71
+01:02:10,500 --> 01:02:10,791
+<b>yeah</b>
+
+72
+01:02:10,791 --> 01:02:11,750
+<b>time to teach </b>
+<b>a lesson</b>
+
+73
+01:02:11,750 --> 01:02:13,500
+<b>only game you</b>
+<b>ever give out is</b>
+<b>misdirection</b>
+
+74
+01:02:13,500 --> 01:02:15,250
+<b>only thing</b>
+<b>you ever really got</b>
+<b>was misconceptions</b>
+
+75
+01:02:15,250 --> 01:02:16,083
+<b>and i can't</b>
+<b>relate to that</b>
+
+76
+01:02:16,083 --> 01:02:16,875
+<b>because this</b>
+<b>direction</b>
+
+77
+01:02:16,875 --> 01:02:17,916
+<b>got me headed</b>
+<b>where i wanna be</b>
+<b>and i'm</b>
+
+78
+01:02:17,916 --> 01:02:18,833
+<b>nabbin'</b>
+<b>achievements</b>
+
+79
+01:02:18,833 --> 01:02:19,958
+<b>i can't stop</b>
+<b>long as i'm breathin'</b>
+
+80
+01:02:19,958 --> 01:02:22,000
+<b>not 'till i'm</b>
+<b>makin' eye contact</b>
+<b>with Angela Yee</b>
+
+81
+01:02:22,000 --> 01:02:23,416
+<b>on the radio</b>
+<b>and just last week</b>
+
+82
+01:02:23,416 --> 01:02:25,291
+<b>i was with</b>
+<b>a lady out in</b>
+<b>Rockaway Beach</b>
+
+83
+01:02:25,291 --> 01:02:26,791
+<b>she wearin' a pair</b>
+<b>of capri's</b>
+
+84
+01:02:26,791 --> 01:02:28,583
+<b>and i stare</b>
+<b>at her hair</b>
+<b>in the breeze</b>
+
+85
+01:02:28,583 --> 01:02:30,166
+<b>i'm practicin'</b>
+<b>mindfullness </b>
+<b>breathing</b>
+
+86
+01:02:30,166 --> 01:02:31,958
+<b>out on a </b>
+<b>Saturday evenin'</b>
+
+87
+01:02:31,958 --> 01:02:33,375
+<b>you better</b>
+<b>believe it, yeah</b>
+
+88
+01:02:33,375 --> 01:02:35,000
+<b>it's just so hard</b>
+<b>to believe it, yeah</b>
+
+89
+01:02:35,000 --> 01:02:36,625
+<b>you still got</b>
+<b>cars out on lease</b>
+<b>and ya</b>
+
+90
+01:02:36,625 --> 01:02:37,916
+<b>wasted your</b>
+<b>college degree</b>
+
+91
+01:02:37,916 --> 01:02:39,333
+<b>and you still</b>
+<b>never left </b>
+<b>the country</b>
+
+92
+01:02:39,333 --> 01:02:40,000
+<b>yikes</b>
+
+93
+01:02:40,000 --> 01:02:41,333
+<b>better you</b>
+<b>than me</b>
+
+94
+01:02:41,333 --> 01:02:42,500
+<b>and i'm</b>
+<b>wishin' you peace</b>
+
+95
+01:02:42,500 --> 01:02:43,541
+<b>only thing that</b>
+<b>can save you</b>
+<b>is Jesus, yeah</b>
+
+96
+01:02:43,541 --> 01:02:44,750
+<b>i feel bad</b>
+
+97
+01:02:45,875 --> 01:02:48,958
+<b>oh i feel bad</b>
+
+98
+01:02:49,250 --> 01:02:50,458
+<b>ooh</b>
+
+99
+01:02:50,458 --> 01:02:51,791
+<b>it isn't my fault</b>
+
+100
+01:02:51,791 --> 01:02:53,875
+<b>you been f------ up</b>
+<b>so much</b>
+
+101
+01:02:53,875 --> 01:02:55,208
+<b>easier falls</b>
+
+102
+01:02:55,208 --> 01:02:57,208
+<b>have been</b>
+<b>broken before but</b>
+
+103
+01:02:57,208 --> 01:02:58,416
+<b>i feel bad</b>
+
+104
+01:03:00,166 --> 01:03:03,250
+<b>i said i feel bad</b>
+
+105
+01:03:03,541 --> 01:03:05,500
+<b>and like what</b>
+<b>do you know</b>
+
+106
+01:03:05,500 --> 01:03:06,791
+<b>climb up</b>
+<b>another notch</b>
+
+107
+01:03:06,791 --> 01:03:08,958
+<b>hey i guess</b>
+<b>you reap what you sew</b>
+
+108
+01:03:08,958 --> 01:03:10,291
+<b>but it's so</b>
+<b>hard to watch</b>
+
+109
+01:03:10,291 --> 01:03:10,875
+<b>lately</b>
+
+110
+01:03:10,875 --> 01:03:12,083
+<b>i feel bad</b>
+
+111
+01:03:14,291 --> 01:03:15,500
+<b>i feel bad</b>
+
+112
+01:03:16,708 --> 01:03:19,083
+<b>i feel bad</b>
+

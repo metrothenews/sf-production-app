@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local virtualenvs
+.venv/
+.venv_local/
+
+# Local runtime artifacts
+work/

@@ -1,0 +1,26 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: script-orchestrator-sync:dev
+    working_dir: /workspace/script-orchestrator-sync
+    volumes:
+      - ..:/workspace
+      - ${HOME}/.config/gcloud:/workspace/.config/gcloud:ro
+    environment:
+      PYTHONPATH: /workspace/script-orchestrator-sync/src
+      SHEETS_JSON_BASE_URL: ${SHEETS_JSON_BASE_URL:-https://YOUR-SHEETS-JSON-GATEWAY.a.run.app}
+      SHEETS_JSON_API_KEY: ${SHEETS_JSON_API_KEY:-}
+      CONTROL_SHEET_ID: ${CONTROL_SHEET_ID:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/workspace/.config/gcloud/application_default_credentials.json}
+      VSE_TEXT_SCRIPT_PATH: ${VSE_TEXT_SCRIPT_PATH:-/workspace/vse-text/scripts/vse_bpm_preset_deterministic_bl456.py}
+      VSE_STITCHER_SCRIPT_PATH: ${VSE_STITCHER_SCRIPT_PATH:-/workspace/vse-stitcher/scripts/vse_bpm_preset_deterministic_bl456.py}
+      BLENDER_BIN: ${BLENDER_BIN:-blender}
+      FFMPEG_BIN: ${FFMPEG_BIN:-ffmpeg}
+    ports:
+      - "8000:8000"
+    command: >
+      uvicorn so_sync.api:app --host 0.0.0.0 --port 8000 --reload
+      --reload-dir /workspace/script-orchestrator-sync/src
+      --reload-dir /workspace/script-orchestrator-sync/scripts
