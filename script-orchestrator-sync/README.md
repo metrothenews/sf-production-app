@@ -21,6 +21,10 @@ This repo now includes a dev-first container setup that keeps editing/debugging 
   - pinned Blender runtime (`BLENDER_VERSION`, default `4.2.2`)
   - `ffmpeg`
   - bundled copies of `script-orchestrator-sync`, `vse-stitcher`, and `vse-text`
+- Container startup checks now fail fast on missing requirements:
+  - `CONTROL_SHEET_ID`
+  - missing `GOOGLE_APPLICATION_CREDENTIALS` file (if env var is set)
+  - missing render binaries/scripts (unless `REQUIRE_RENDER_BINARIES=0`)
 
 From `script-orchestrator-sync/`:
 
@@ -58,6 +62,27 @@ docker run --rm -p 8000:8000 \
   -v /path/to/key.json:/secrets/key.json:ro \
   script-orchestrator-sync:vm
 ```
+
+Production compose (recommended on VM):
+
+```bash
+cp .env.prod.example .env.prod
+# edit .env.prod
+make docker-build-prod
+make docker-up-prod
+```
+
+VM update/deploy command (pull + build + restart + health check):
+
+```bash
+make deploy-vm
+```
+
+The deploy script (`scripts/deploy_vm.sh`) does:
+- `git fetch/pull` (fast-forward only)
+- `docker compose -f docker-compose.yml -f docker-compose.prod.yml build app`
+- `docker compose ... up -d app`
+- polls `http://127.0.0.1:${APP_PORT:-8000}/healthz` until healthy
 
 ## Happy Path Entrypoints
 

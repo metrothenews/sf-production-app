@@ -4,8 +4,9 @@ SHELL := /bin/bash
 BASE_URL_DEFAULT := https://YOUR-SHEETS-JSON-GATEWAY.a.run.app
 REPO_DIR := $(CURDIR)
 COMPOSE ?= docker compose
+COMPOSE_PROD := $(COMPOSE) -f docker-compose.yml -f docker-compose.prod.yml
 
-.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch docker-build docker-up docker-down docker-shell docker-run-batch
+.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm
 
 venv:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -123,3 +124,15 @@ docker-run-batch:
 	@if [ -z "$$CONTROL_SHEET_ID" ]; then echo "ERROR: CONTROL_SHEET_ID is required."; exit 1; fi
 	@set -euo pipefail; \
 	$(COMPOSE) run --rm app python scripts/trigger_render_batch.py
+
+docker-build-prod:
+	@$(COMPOSE_PROD) build app
+
+docker-up-prod:
+	@$(COMPOSE_PROD) up -d app
+
+docker-down-prod:
+	@$(COMPOSE_PROD) down
+
+deploy-vm:
+	@bash scripts/deploy_vm.sh
