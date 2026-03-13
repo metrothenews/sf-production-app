@@ -53,7 +53,8 @@ ENV PYTHONPATH=/workspace/script-orchestrator-sync/src \
     VSE_STITCHER_SCRIPT_PATH=/workspace/vse-stitcher/scripts/vse_bpm_preset_deterministic_bl456.py \
     VSE_TEXT_SCRIPT_PATH=/workspace/vse-text/scripts/vse_bpm_preset_deterministic_bl456.py
 
-RUN chmod +x /workspace/script-orchestrator-sync/scripts/container_start.sh
+RUN chmod +x /workspace/script-orchestrator-sync/scripts/container_start.sh \
+    /workspace/script-orchestrator-sync/scripts/batch_entrypoint.sh
 
 EXPOSE 8000
 

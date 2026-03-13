@@ -10,15 +10,19 @@ Provides the minimal endpoints required by the contract:
 
 from __future__ import annotations
 
+import datetime as dt
+import os
+import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .batch_trigger import BatchTriggerError, get_batch_job_status, start_render_batch_via_batch
 from .config import AppConfig
-from .sync_engine import execute_job
 from .repositories import find_run_by_id
 from .render_batch_trigger import start_render_batch_process
+from .sync_engine import execute_job
 
 app = FastAPI(title="script-orchestrator-sync", version="v1.0.0")
 
@@ -54,6 +58,46 @@ class RenderBatchRunResponse(BaseModel):
     queued_job_ids: list[str] = Field(default_factory=list)
     final_progress: dict[str, Any] | None = None
     log_path: str | None = None
+    execution_backend: str = "local"
+    batch_job_name: str | None = None
+    batch_region: str | None = None
+    submitted_utc: str | None = None
+    correlation_id: str | None = None
+
+
+class BatchJobStatusResponse(BaseModel):
+    status: str
+    batch_job_name: str
+    batch_region: str
+    batch_state: str
+    submitted_utc: str | None = None
+    updated_utc: str | None = None
+
+
+def _selected_render_backend() -> str:
+    backend = str(os.environ.get("RENDER_EXEC_BACKEND", "local")).strip().lower() or "local"
+    if backend not in {"local", "batch"}:
+        raise ValueError("RENDER_EXEC_BACKEND must be one of: local, batch")
+    return backend
+
+
+def _error_payload(*, message: str, correlation_id: str, backend: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "pid": None,
+        "return_code": None,
+        "busy_reason": None,
+        "noop_reason": None,
+        "error": message,
+        "queued_job_ids": [],
+        "final_progress": None,
+        "log_path": None,
+        "execution_backend": backend,
+        "batch_job_name": None,
+        "batch_region": None,
+        "submitted_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "correlation_id": correlation_id,
+    }
 
 @app.post("/api/v1/jobs/{job_id}/run", response_model=RunResponse)
 def run_job(job_id: str, req: RunRequest):
@@ -89,25 +133,66 @@ def get_run(run_id: str):
 
 
 @app.post("/api/v1/render/run-batch", response_model=RenderBatchRunResponse)
-def run_render_batch(req: RenderBatchRunRequest | None = None):
+def run_render_batch(request: Request, req: RenderBatchRunRequest | None = None):
     payload = req or RenderBatchRunRequest()
-    startup_wait_seconds = 0.75 if payload.startup_wait_seconds is None else payload.startup_wait_seconds
-    result = start_render_batch_process(
-        control_sheet_id=config.control_sheet_id,
-        poll_seconds=payload.poll_seconds,
-        max_rounds=payload.max_rounds,
-        startup_wait_seconds=startup_wait_seconds,
-        extra_env={
-            "SHEETS_JSON_BASE_URL": config.sheets_json_base_url,
-            "SHEETS_JSON_API_KEY": config.sheets_json_api_key or "",
-        },
+    correlation_id = uuid.uuid4().hex
+    try:
+        backend = _selected_render_backend()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=_error_payload(message=str(exc), correlation_id=correlation_id, backend="unknown"),
+        )
+    requested_by = (
+        str(request.headers.get("x-requested-by", "")).strip()
+        or str(request.headers.get("x-user-email", "")).strip()
+        or str(request.client.host if request.client else "").strip()
     )
+    if backend == "batch":
+        try:
+            result = start_render_batch_via_batch(
+                gateway=_gateway(),
+                control_sheet_id=config.control_sheet_id,
+                poll_seconds=payload.poll_seconds,
+                max_rounds=payload.max_rounds,
+                requested_by=requested_by,
+                trace_id=correlation_id[:12],
+            )
+        except BatchTriggerError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=_error_payload(message=str(exc), correlation_id=correlation_id, backend=backend),
+            )
+    else:
+        startup_wait_seconds = 0.75 if payload.startup_wait_seconds is None else payload.startup_wait_seconds
+        result = start_render_batch_process(
+            control_sheet_id=config.control_sheet_id,
+            poll_seconds=payload.poll_seconds,
+            max_rounds=payload.max_rounds,
+            startup_wait_seconds=startup_wait_seconds,
+            extra_env={
+                "SHEETS_JSON_BASE_URL": config.sheets_json_base_url,
+                "SHEETS_JSON_API_KEY": config.sheets_json_api_key or "",
+            },
+        )
+    result["execution_backend"] = backend
+    result["correlation_id"] = correlation_id
     status = str(result.get("status") or "")
     if status == "busy":
         raise HTTPException(status_code=409, detail=result)
     if status == "error":
         raise HTTPException(status_code=500, detail=result)
     return RenderBatchRunResponse(**result)
+
+
+@app.get("/api/v1/render/batch-jobs/{batch_job_name:path}", response_model=BatchJobStatusResponse)
+def render_batch_job_status(batch_job_name: str):
+    try:
+        status = get_batch_job_status(batch_job_name)
+    except BatchTriggerError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return BatchJobStatusResponse(**status)
+
 
 @app.get("/healthz")
 def healthz():
