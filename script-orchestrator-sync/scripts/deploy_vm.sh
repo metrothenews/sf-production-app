@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BRANCH="${DEPLOY_BRANCH:-master}"
 APP_PORT="${APP_PORT:-8000}"
-COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.prod.yml)
+COMPOSE_FILES=(-f docker-compose.prod.yml)
 
 cd "${REPO_DIR}"
 

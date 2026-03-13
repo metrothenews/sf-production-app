@@ -4,9 +4,9 @@ SHELL := /bin/bash
 BASE_URL_DEFAULT := https://YOUR-SHEETS-JSON-GATEWAY.a.run.app
 REPO_DIR := $(CURDIR)
 COMPOSE ?= docker compose
-COMPOSE_PROD := $(COMPOSE) -f docker-compose.yml -f docker-compose.prod.yml
+COMPOSE_PROD := $(COMPOSE) -f docker-compose.prod.yml
 
-.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm
+.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm vm-bootstrap
 
 venv:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -136,3 +136,6 @@ docker-down-prod:
 
 deploy-vm:
 	@bash scripts/deploy_vm.sh
+
+vm-bootstrap:
+	@bash scripts/bootstrap_vm.sh
