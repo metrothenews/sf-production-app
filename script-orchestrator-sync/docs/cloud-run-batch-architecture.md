@@ -37,6 +37,7 @@ Required for batch mode:
 Recommended defaults:
 - `BATCH_JOB_QUEUE=render-default`
 - `BATCH_MACHINE_TYPE=n2d-standard-8`
+- `BATCH_SERVICE_ACCOUNT_EMAIL=so-render-batch@<project-id>.iam.gserviceaccount.com`
 - `BATCH_MAX_RETRIES=1`
 - `BATCH_TIMEOUT_SECONDS=14400`
 - `BATCH_TASK_CPU_MILLI=8000`
@@ -56,6 +57,7 @@ Cloud Run service account:
 Batch runtime service account:
 - `roles/logging.logWriter`
 - `roles/secretmanager.secretAccessor` (if retrieving secrets at runtime)
+- `roles/artifactregistry.reader` (to pull private container images)
 
 ## Request/Response Contract
 Endpoint: `POST /api/v1/render/run-batch`
@@ -111,16 +113,33 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 gcloud projects add-iam-policy-binding <PROJECT_ID> \
   --member="serviceAccount:so-control-api@<PROJECT_ID>.iam.gserviceaccount.com" \
   --role="roles/logging.logWriter"
+gcloud iam service-accounts add-iam-policy-binding \
+  "so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --member="serviceAccount:so-control-api@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser"
 ```
 
-4. (If needed) create/update secret:
+4. Grant Batch runtime SA permissions:
+```bash
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+  --member="serviceAccount:so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --role="roles/logging.logWriter"
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+  --member="serviceAccount:so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+  --member="serviceAccount:so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.reader"
+```
+
+5. (If needed) create/update secret:
 ```bash
 printf '%s' '<SERVICE_ACCOUNT_JSON>' | gcloud secrets create so-drive-sa-key-json --data-file=-
 # If secret already exists:
 # printf '%s' '<SERVICE_ACCOUNT_JSON>' | gcloud secrets versions add so-drive-sa-key-json --data-file=-
 ```
 
-5. Deploy Cloud Run API:
+6. Deploy Cloud Run API:
 ```bash
 gcloud run deploy so-control-api \
   --image "${IMAGE}" \
@@ -129,11 +148,11 @@ gcloud run deploy so-control-api \
   --min-instances 0 \
   --max-instances 1 \
   --concurrency 1 \
-  --set-env-vars "RENDER_EXEC_BACKEND=batch,GCP_PROJECT_ID=<PROJECT_ID>,GCP_REGION=us-east1,BATCH_IMAGE_URI=${IMAGE},BATCH_MACHINE_TYPE=n2d-standard-8,BATCH_MAX_RETRIES=1,BATCH_TIMEOUT_SECONDS=14400,BATCH_TASK_CPU_MILLI=8000,BATCH_TASK_MEMORY_MIB=32768,BATCH_JOB_QUEUE=render-default,CONTROL_SHEET_ID=<CONTROL_SHEET_ID>,SHEETS_JSON_BASE_URL=https://YOUR-SHEETS-JSON-GATEWAY.a.run.app,DRIVE_SA_KEY_FILE=/secrets/drive-sa.json" \
+  --set-env-vars "RENDER_EXEC_BACKEND=batch,GCP_PROJECT_ID=<PROJECT_ID>,GCP_REGION=us-east1,BATCH_IMAGE_URI=${IMAGE},BATCH_MACHINE_TYPE=n2d-standard-8,BATCH_SERVICE_ACCOUNT_EMAIL=so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com,BATCH_MAX_RETRIES=1,BATCH_TIMEOUT_SECONDS=14400,BATCH_TASK_CPU_MILLI=8000,BATCH_TASK_MEMORY_MIB=32768,BATCH_JOB_QUEUE=render-default,CONTROL_SHEET_ID=<CONTROL_SHEET_ID>,SHEETS_JSON_BASE_URL=https://YOUR-SHEETS-JSON-GATEWAY.a.run.app,DRIVE_SA_KEY_FILE=/secrets/drive-sa.json" \
   --set-secrets "DRIVE_SA_KEY_JSON=so-drive-sa-key-json:latest"
 ```
 
-6. Trigger a render batch:
+7. Trigger a render batch:
 ```bash
 curl -X POST "https://<RUN_URL>/api/v1/render/run-batch" \
   -H "Content-Type: application/json" \
@@ -141,7 +160,7 @@ curl -X POST "https://<RUN_URL>/api/v1/render/run-batch" \
   -d '{"poll_seconds":1.0,"max_rounds":40}'
 ```
 
-7. Check status:
+8. Check status:
 ```bash
 curl "https://<RUN_URL>/api/v1/render/batch-jobs/<batch-job-id-or-full-name>" \
   -H "Authorization: Bearer $(gcloud auth print-identity-token)"

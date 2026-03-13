@@ -62,4 +62,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
 ENTRYPOINT ["/workspace/script-orchestrator-sync/scripts/container_start.sh"]
-CMD ["uvicorn", "so_sync.api:app", "--host", "0.0.0.0", "--port", "8000"]

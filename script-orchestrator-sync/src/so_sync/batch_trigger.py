@@ -6,7 +6,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from .gateway import SheetsGateway
 from .render_contract import RENDER_STATUS_LEASED, RENDER_STATUS_RUNNING
@@ -29,6 +29,7 @@ class BatchTriggerConfig:
     task_cpu_milli: int
     task_memory_mib: int
     job_queue: str
+    batch_service_account_email: str
     drive_sa_key_json: str
     drive_sa_key_file: str
     control_sheet_id: str
@@ -59,6 +60,7 @@ class BatchTriggerConfig:
             task_cpu_milli=_to_int(str(os.environ.get("BATCH_TASK_CPU_MILLI", "8000")), fallback=8000),
             task_memory_mib=_to_int(str(os.environ.get("BATCH_TASK_MEMORY_MIB", "32768")), fallback=32768),
             job_queue=str(os.environ.get("BATCH_JOB_QUEUE", "render-default")).strip() or "render-default",
+            batch_service_account_email=str(os.environ.get("BATCH_SERVICE_ACCOUNT_EMAIL", "")).strip(),
             drive_sa_key_json=str(os.environ.get("DRIVE_SA_KEY_JSON", "")),
             drive_sa_key_file=str(os.environ.get("DRIVE_SA_KEY_FILE", "/secrets/drive-sa.json")).strip()
             or "/secrets/drive-sa.json",
@@ -148,6 +150,18 @@ def build_batch_create_request(
         "GOOGLE_APPLICATION_CREDENTIALS": cfg.drive_sa_key_file,
     }
 
+    allocation_policy: dict[str, Any] = {
+        "instances": [
+            {
+                "policy": {
+                    "machine_type": cfg.machine_type,
+                }
+            }
+        ]
+    }
+    if cfg.batch_service_account_email:
+        allocation_policy["service_account"] = {"email": cfg.batch_service_account_email}
+
     request: dict[str, Any] = {
         "parent": f"projects/{cfg.project_id}/locations/{cfg.region}",
         "job_id": job_id,
@@ -177,15 +191,7 @@ def build_batch_create_request(
                     },
                 }
             ],
-            "allocation_policy": {
-                "instances": [
-                    {
-                        "policy": {
-                            "machine_type": cfg.machine_type,
-                        }
-                    }
-                ]
-            },
+            "allocation_policy": allocation_policy,
             "logs_policy": {"destination": "CLOUD_LOGGING"},
         },
     }

@@ -38,6 +38,7 @@ def test_build_batch_create_request_has_expected_command_and_env() -> None:
         task_cpu_milli=8000,
         task_memory_mib=32768,
         job_queue="render-default",
+        batch_service_account_email="so-render-batch@proj_1.iam.gserviceaccount.com",
         drive_sa_key_json="{\"type\":\"service_account\"}",
         drive_sa_key_file="/secrets/drive-sa.json",
         control_sheet_id="sheet_1",
@@ -62,6 +63,7 @@ def test_build_batch_create_request_has_expected_command_and_env() -> None:
     assert env_vars["CONTROL_SHEET_ID"] == "sheet_1"
     assert env_vars["DRIVE_SA_KEY_FILE"] == "/secrets/drive-sa.json"
     assert req["job"]["allocation_policy"]["instances"][0]["policy"]["machine_type"] == "n2d-standard-8"
+    assert req["job"]["allocation_policy"]["service_account"]["email"] == "so-render-batch@proj_1.iam.gserviceaccount.com"
 
 
 def test_get_batch_job_status_with_short_id(monkeypatch) -> None:
