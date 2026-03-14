@@ -39,6 +39,10 @@ def test_build_batch_create_request_has_expected_command_and_env() -> None:
         task_memory_mib=32768,
         job_queue="render-default",
         batch_service_account_email="so-render-batch@proj_1.iam.gserviceaccount.com",
+        batch_service_account_scopes=(
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/drive",
+        ),
         drive_sa_key_json="{\"type\":\"service_account\"}",
         drive_sa_key_file="/secrets/drive-sa.json",
         control_sheet_id="sheet_1",
@@ -62,8 +66,54 @@ def test_build_batch_create_request_has_expected_command_and_env() -> None:
     env_vars = req["job"]["task_groups"][0]["task_spec"]["environment"]["variables"]
     assert env_vars["CONTROL_SHEET_ID"] == "sheet_1"
     assert env_vars["DRIVE_SA_KEY_FILE"] == "/secrets/drive-sa.json"
+    assert env_vars["DRIVE_SA_KEY_JSON"] == "{\"type\":\"service_account\"}"
+    assert env_vars["GOOGLE_APPLICATION_CREDENTIALS"] == "/secrets/drive-sa.json"
     assert req["job"]["allocation_policy"]["instances"][0]["policy"]["machine_type"] == "n2d-standard-8"
     assert req["job"]["allocation_policy"]["service_account"]["email"] == "so-render-batch@proj_1.iam.gserviceaccount.com"
+    assert req["job"]["allocation_policy"]["service_account"]["scopes"] == [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+
+def test_build_batch_create_request_omits_key_material_when_not_configured() -> None:
+    cfg = BatchTriggerConfig(
+        project_id="proj_1",
+        region="us-east1",
+        image_uri="us-east1-docker.pkg.dev/proj/repo/app:abc",
+        machine_type="n2d-standard-8",
+        max_retries=1,
+        timeout_seconds=14400,
+        task_cpu_milli=8000,
+        task_memory_mib=32768,
+        job_queue="render-default",
+        batch_service_account_email="so-drive-worker@proj_1.iam.gserviceaccount.com",
+        batch_service_account_scopes=(
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/drive",
+        ),
+        drive_sa_key_json="",
+        drive_sa_key_file="/secrets/drive-sa.json",
+        control_sheet_id="sheet_1",
+        sheets_json_base_url="https://example.invalid",
+        sheets_json_api_key="k",
+        require_render_binaries="1",
+    )
+    _, req = build_batch_create_request(
+        cfg,
+        poll_seconds=1.0,
+        max_rounds=10,
+        requested_by="metrothenews@gmail.com",
+        trace_id="trace123",
+    )
+    env_vars = req["job"]["task_groups"][0]["task_spec"]["environment"]["variables"]
+    assert "DRIVE_SA_KEY_JSON" not in env_vars
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in env_vars
+    assert env_vars["DRIVE_SA_KEY_FILE"] == "/secrets/drive-sa.json"
+    assert req["job"]["allocation_policy"]["service_account"]["scopes"] == [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
 
 def test_get_batch_job_status_with_short_id(monkeypatch) -> None:
@@ -89,3 +139,11 @@ def test_get_batch_job_status_with_short_id(monkeypatch) -> None:
     assert out["status"] == "running"
     assert out["batch_job_name"].endswith("/jobs/render-abc")
     assert out["batch_state"] == "running"
+
+
+def test_batch_trigger_config_from_env_parses_scopes(monkeypatch) -> None:
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj_1")
+    monkeypatch.setenv("BATCH_IMAGE_URI", "us-east1-docker.pkg.dev/proj/repo/app:abc")
+    monkeypatch.setenv("BATCH_SERVICE_ACCOUNT_SCOPES", "scopeA, scopeB,scopeA")
+    cfg = BatchTriggerConfig.from_env(control_sheet_id="sheet_1")
+    assert cfg.batch_service_account_scopes == ("scopeA", "scopeB")

@@ -30,6 +30,7 @@ class BatchTriggerConfig:
     task_memory_mib: int
     job_queue: str
     batch_service_account_email: str
+    batch_service_account_scopes: tuple[str, ...]
     drive_sa_key_json: str
     drive_sa_key_file: str
     control_sheet_id: str
@@ -61,6 +62,14 @@ class BatchTriggerConfig:
             task_memory_mib=_to_int(str(os.environ.get("BATCH_TASK_MEMORY_MIB", "32768")), fallback=32768),
             job_queue=str(os.environ.get("BATCH_JOB_QUEUE", "render-default")).strip() or "render-default",
             batch_service_account_email=str(os.environ.get("BATCH_SERVICE_ACCOUNT_EMAIL", "")).strip(),
+            batch_service_account_scopes=_parse_scopes(
+                str(
+                    os.environ.get(
+                        "BATCH_SERVICE_ACCOUNT_SCOPES",
+                        "https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive",
+                    )
+                ).strip()
+            ),
             drive_sa_key_json=str(os.environ.get("DRIVE_SA_KEY_JSON", "")),
             drive_sa_key_file=str(os.environ.get("DRIVE_SA_KEY_FILE", "/secrets/drive-sa.json")).strip()
             or "/secrets/drive-sa.json",
@@ -76,6 +85,15 @@ def _to_int(raw: str, *, fallback: int) -> int:
         return int(str(raw).strip())
     except Exception:
         return fallback
+
+
+def _parse_scopes(raw: str) -> tuple[str, ...]:
+    values = []
+    for scope in str(raw or "").split(","):
+        text = scope.strip()
+        if text and text not in values:
+            values.append(text)
+    return tuple(values)
 
 
 def _utc_now() -> str:
@@ -144,11 +162,17 @@ def build_batch_create_request(
         "CONTROL_SHEET_ID": cfg.control_sheet_id,
         "SHEETS_JSON_BASE_URL": cfg.sheets_json_base_url,
         "SHEETS_JSON_API_KEY": cfg.sheets_json_api_key,
-        "DRIVE_SA_KEY_JSON": cfg.drive_sa_key_json,
-        "DRIVE_SA_KEY_FILE": cfg.drive_sa_key_file,
         "REQUIRE_RENDER_BINARIES": cfg.require_render_binaries,
-        "GOOGLE_APPLICATION_CREDENTIALS": cfg.drive_sa_key_file,
     }
+    key_file = str(cfg.drive_sa_key_file or "").strip()
+    if key_file:
+        env_vars["DRIVE_SA_KEY_FILE"] = key_file
+    # Only materialize a key file when key JSON is explicitly configured.
+    # Preferred production mode is attached service account credentials.
+    if str(cfg.drive_sa_key_json or "").strip():
+        env_vars["DRIVE_SA_KEY_JSON"] = cfg.drive_sa_key_json
+        if key_file:
+            env_vars["GOOGLE_APPLICATION_CREDENTIALS"] = key_file
 
     allocation_policy: dict[str, Any] = {
         "instances": [
@@ -159,8 +183,13 @@ def build_batch_create_request(
             }
         ]
     }
+    service_account_policy: dict[str, Any] = {}
     if cfg.batch_service_account_email:
-        allocation_policy["service_account"] = {"email": cfg.batch_service_account_email}
+        service_account_policy["email"] = cfg.batch_service_account_email
+    if cfg.batch_service_account_scopes:
+        service_account_policy["scopes"] = list(cfg.batch_service_account_scopes)
+    if service_account_policy:
+        allocation_policy["service_account"] = service_account_policy
 
     request: dict[str, Any] = {
         "parent": f"projects/{cfg.project_id}/locations/{cfg.region}",

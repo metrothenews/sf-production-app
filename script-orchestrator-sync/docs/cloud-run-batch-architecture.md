@@ -38,15 +38,18 @@ Recommended defaults:
 - `BATCH_JOB_QUEUE=render-default`
 - `BATCH_MACHINE_TYPE=n2d-standard-8`
 - `BATCH_SERVICE_ACCOUNT_EMAIL=so-render-batch@<project-id>.iam.gserviceaccount.com`
+- `BATCH_SERVICE_ACCOUNT_SCOPES=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive`
 - `BATCH_MAX_RETRIES=1`
 - `BATCH_TIMEOUT_SECONDS=14400`
 - `BATCH_TASK_CPU_MILLI=8000`
 - `BATCH_TASK_MEMORY_MIB=32768`
 
-Credential materialization:
-- `DRIVE_SA_KEY_JSON=<json secret payload>`
-- `DRIVE_SA_KEY_FILE=/secrets/drive-sa.json`
-- `GOOGLE_APPLICATION_CREDENTIALS` is set to `DRIVE_SA_KEY_FILE` during worker startup.
+Credentials:
+- Preferred: attached Batch service account + `BATCH_SERVICE_ACCOUNT_SCOPES` including Drive scope.
+- Optional key mode:
+  - `DRIVE_SA_KEY_JSON=<json secret payload>`
+  - `DRIVE_SA_KEY_FILE=/secrets/drive-sa.json`
+  - `GOOGLE_APPLICATION_CREDENTIALS` is set to `DRIVE_SA_KEY_FILE` during worker startup.
 
 ## IAM Model
 Cloud Run service account:
@@ -148,8 +151,10 @@ gcloud run deploy so-control-api \
   --min-instances 0 \
   --max-instances 1 \
   --concurrency 1 \
-  --set-env-vars "RENDER_EXEC_BACKEND=batch,GCP_PROJECT_ID=<PROJECT_ID>,GCP_REGION=us-east1,BATCH_IMAGE_URI=${IMAGE},BATCH_MACHINE_TYPE=n2d-standard-8,BATCH_SERVICE_ACCOUNT_EMAIL=so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com,BATCH_MAX_RETRIES=1,BATCH_TIMEOUT_SECONDS=14400,BATCH_TASK_CPU_MILLI=8000,BATCH_TASK_MEMORY_MIB=32768,BATCH_JOB_QUEUE=render-default,CONTROL_SHEET_ID=<CONTROL_SHEET_ID>,SHEETS_JSON_BASE_URL=https://YOUR-SHEETS-JSON-GATEWAY.a.run.app,DRIVE_SA_KEY_FILE=/secrets/drive-sa.json" \
-  --set-secrets "DRIVE_SA_KEY_JSON=so-drive-sa-key-json:latest"
+  --set-env-vars "RENDER_EXEC_BACKEND=batch,GCP_PROJECT_ID=<PROJECT_ID>,GCP_REGION=us-east1,BATCH_IMAGE_URI=${IMAGE},BATCH_MACHINE_TYPE=n2d-standard-8,BATCH_SERVICE_ACCOUNT_EMAIL=so-render-batch@<PROJECT_ID>.iam.gserviceaccount.com,BATCH_SERVICE_ACCOUNT_SCOPES=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive,BATCH_MAX_RETRIES=1,BATCH_TIMEOUT_SECONDS=14400,BATCH_TASK_CPU_MILLI=8000,BATCH_TASK_MEMORY_MIB=32768,BATCH_JOB_QUEUE=render-default,CONTROL_SHEET_ID=<CONTROL_SHEET_ID>,SHEETS_JSON_BASE_URL=https://YOUR-SHEETS-JSON-GATEWAY.a.run.app"
+# Optional (key mode only):
+# --set-env-vars "...,DRIVE_SA_KEY_FILE=/secrets/drive-sa.json" \
+# --set-secrets "DRIVE_SA_KEY_JSON=so-drive-sa-key-json:latest"
 ```
 
 7. Trigger a render batch:
@@ -171,6 +176,20 @@ curl "https://<RUN_URL>/api/v1/render/batch-jobs/<batch-job-id-or-full-name>" \
 - Batch submit failures return `500` with `correlation_id`.
 - Missing batch config (`GCP_PROJECT_ID`, `BATCH_IMAGE_URI`) returns `500` with clear error.
 - Worker-side auth issues fail fast in `scripts/batch_entrypoint.sh`/render script startup.
+
+## Hardening Path (Remove User ADC Secret)
+Current successful runtime uses secret materialization for `GOOGLE_APPLICATION_CREDENTIALS`. To harden:
+
+1. Create a Shared Drive for render artifacts.
+2. Move/create `output_parent_folder_id` and manifest folder under that Shared Drive.
+3. Grant `so-drive-worker@<PROJECT_ID>.iam.gserviceaccount.com` Content manager on the Shared Drive.
+4. Rotate `so-drive-sa-key-json` away from user ADC:
+   - preferred: remove `DRIVE_SA_KEY_JSON` binding and run with attached Batch SA only.
+   - alternative: store a service-account key JSON scoped for Shared Drive operations.
+5. Keep `BATCH_SERVICE_ACCOUNT_SCOPES` including Drive.
+6. Re-run smoke:
+   - trigger run
+   - verify manifest upload, render success, output uploads, and cleanup behavior.
 
 ## Rollback
 To roll back quickly to in-container local subprocess flow:
