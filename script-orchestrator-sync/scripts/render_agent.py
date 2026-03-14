@@ -152,6 +152,16 @@ def _sanitize_label(label: str) -> str:
     return safe or "clip"
 
 
+def _normalize_category_key(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    for ch in raw:
+        if ch.isalpha():
+            return ch.upper()
+    return ""
+
+
 def build_pipeline_workdir_paths(run_id: str, *, base_tmp_dir: str | None = None) -> dict[str, str]:
     root = Path(base_tmp_dir or tempfile.gettempdir()) / "so_work" / run_id
     return {
@@ -185,7 +195,11 @@ def resolve_pipeline_v1_input_ids(manifest: dict[str, Any], job: dict[str, Any])
             if not drive_id:
                 continue
             label = str(raw.get("label") or f"clip_{i:03d}").strip()
-            clips.append({"drive_file_id": drive_id, "label": label})
+            clip_row = {"drive_file_id": drive_id, "label": label}
+            category = _normalize_category_key(raw.get("category") or raw.get("cat") or "")
+            if category:
+                clip_row["category"] = category
+            clips.append(clip_row)
     audio_id = str(inputs.get("audio_drive_file_id") or job.get("audio_drive_file_id") or "").strip()
     lyrics_id = str(inputs.get("lyrics_srt_drive_file_id") or job.get("srt_drive_file_id") or "").strip()
     copy_id = str(inputs.get("copy_srt_drive_file_id") or job.get("copy_srt_drive_file_id") or "").strip()
@@ -230,21 +244,48 @@ def _extract_stitch_categories(stitch_preset: str) -> list[str]:
     return out
 
 
-def _build_stitcher_media_root(clip_paths: list[str], media_root_dir: str, *, stitch_preset: str = "") -> str:
-    if not clip_paths:
+def _build_stitcher_media_root(clip_sources: list[Any], media_root_dir: str, *, stitch_preset: str = "") -> str:
+    if not clip_sources:
         raise RuntimeError("pipeline_v1 requires at least one clip for stitch stage")
     root = Path(media_root_dir)
     root.mkdir(parents=True, exist_ok=True)
-    # Mirror clips into every category referenced by the preset.
-    # Keep A/B/C as fallback buckets for legacy presets.
+    normalized: list[dict[str, str]] = []
+    for item in clip_sources:
+        if isinstance(item, dict):
+            path = str(item.get("path") or item.get("clip_path") or "").strip()
+            category = _normalize_category_key(item.get("category") or "")
+        else:
+            path = str(item or "").strip()
+            category = ""
+        if not path:
+            continue
+        normalized.append({"path": path, "category": category})
+    if not normalized:
+        raise RuntimeError("pipeline_v1 stitch stage has no valid clip paths")
+
+    by_category: dict[str, list[str]] = {}
+    uncategorized: list[str] = []
+    for row in normalized:
+        cat = str(row.get("category") or "").strip()
+        if cat:
+            by_category.setdefault(cat, []).append(str(row["path"]))
+        else:
+            uncategorized.append(str(row["path"]))
+
     buckets = _extract_stitch_categories(stitch_preset)
-    for legacy in ("A", "B", "C"):
-        if legacy not in buckets:
-            buckets.append(legacy)
+    if not buckets:
+        buckets = sorted(by_category.keys()) or ["A", "B", "C"]
+
     for bucket in buckets:
+        pool = list(by_category.get(bucket) or [])
+        if not pool and uncategorized:
+            # Backward compatibility for manifests that do not carry category tags.
+            pool = list(uncategorized)
+        if not pool:
+            raise RuntimeError(f"No clips found for stitch preset category '{bucket}'")
         bucket_dir = root / bucket
         bucket_dir.mkdir(parents=True, exist_ok=True)
-        for i, clip in enumerate(clip_paths, start=1):
+        for i, clip in enumerate(pool, start=1):
             src = Path(clip)
             name = f"{i:03d}_{src.name}"
             _safe_link_or_copy(str(src), str(bucket_dir / name))
@@ -272,6 +313,200 @@ def build_ffmpeg_cut_command(
         "copy",
         output_path,
     ]
+
+
+def build_ffmpeg_audio_trim_command(
+    *,
+    ffmpeg_bin: str,
+    input_path: str,
+    start: str,
+    end: str,
+    output_path: str,
+) -> list[str]:
+    return [
+        ffmpeg_bin,
+        "-y",
+        "-ss",
+        start,
+        "-to",
+        end,
+        "-i",
+        input_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        output_path,
+    ]
+
+
+def _format_seconds_to_ffmpeg_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000.0)))
+    hh = total_ms // 3_600_000
+    mm = (total_ms % 3_600_000) // 60_000
+    ss = (total_ms % 60_000) // 1000
+    ms = total_ms % 1000
+    return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
+
+
+def _parse_srt_timecode_to_ms(tc: str) -> int:
+    m = re.match(r"^\s*(\d+):(\d+):(\d+)[,.](\d+)\s*$", str(tc or ""))
+    if not m:
+        raise ValueError(f"Bad SRT timecode: {tc!r}")
+    hh, mm, ss, ms = [int(x) for x in m.groups()]
+    return ((hh * 3600 + mm * 60 + ss) * 1000) + ms
+
+
+def _extract_srt_timecode_token(raw: str) -> str:
+    m = re.search(r"(\d+:\d+:\d+[,.]\d+)", str(raw or ""))
+    if not m:
+        raise ValueError(f"Bad SRT time token: {raw!r}")
+    return str(m.group(1))
+
+
+def _format_ms_to_srt_timecode(ms: int) -> str:
+    value = max(0, int(ms))
+    hh = value // 3_600_000
+    mm = (value % 3_600_000) // 60_000
+    ss = (value % 60_000) // 1000
+    rem = value % 1000
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{rem:03d}"
+
+
+def _slice_and_shift_srt_file(
+    *,
+    input_path: str,
+    output_path: str,
+    start_s: float,
+    end_s: float,
+) -> bool:
+    src = Path(input_path)
+    raw = src.read_text(encoding="utf-8", errors="ignore")
+    lines = raw.splitlines()
+    start_ms = max(0, int(round(float(start_s) * 1000.0)))
+    end_ms = max(start_ms, int(round(float(end_s) * 1000.0)))
+    duration_ms = max(0, end_ms - start_ms)
+    boundary_epsilon_ms = 1
+
+    parsed_blocks: list[tuple[int, int, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        while i < len(lines) and not str(lines[i]).strip():
+            i += 1
+        if i >= len(lines):
+            break
+        # optional numeric index
+        if re.match(r"^\s*\d+\s*$", str(lines[i])):
+            i += 1
+        if i >= len(lines):
+            break
+        if "-->" not in str(lines[i]):
+            i += 1
+            continue
+        left, right = [x.strip() for x in str(lines[i]).split("-->", 1)]
+        i += 1
+        try:
+            cue_start = _parse_srt_timecode_to_ms(_extract_srt_timecode_token(left))
+            cue_end = _parse_srt_timecode_to_ms(_extract_srt_timecode_token(right))
+        except Exception:
+            while i < len(lines) and str(lines[i]).strip():
+                i += 1
+            continue
+        text_lines: list[str] = []
+        while i < len(lines) and str(lines[i]).strip():
+            text_lines.append(str(lines[i]))
+            i += 1
+        parsed_blocks.append((cue_start, cue_end, text_lines))
+
+    if not parsed_blocks:
+        Path(output_path).write_text("", encoding="utf-8")
+        return False
+
+    first_start_ms = min(s for s, _, _ in parsed_blocks)
+    hour_shift_ms = 0
+    # Handle Resolve-style SRT clocks (01:00:00,000+) before cut overlap math.
+    if first_start_ms >= 1_800_000 and first_start_ms > (end_ms + 60_000):
+        hour_shift_ms = -((first_start_ms // 3_600_000) * 3_600_000)
+
+    out_blocks: list[str] = []
+    out_idx = 1
+    for cue_start, cue_end, text_lines in parsed_blocks:
+        shifted_start = cue_start + hour_shift_ms
+        shifted_end = cue_end + hour_shift_ms
+        if shifted_end <= shifted_start or shifted_end <= 0:
+            continue
+        if shifted_start < 0:
+            shifted_start = 0
+        overlap_start = max(shifted_start, start_ms - boundary_epsilon_ms)
+        overlap_end = min(shifted_end, end_ms + boundary_epsilon_ms)
+        if overlap_end <= overlap_start:
+            continue
+        rel_start = max(0, min(duration_ms, overlap_start - start_ms))
+        rel_end = max(0, min(duration_ms, overlap_end - start_ms))
+        if rel_end <= rel_start:
+            # Keep exact boundary-touching cues as 1ms clips so per-cut lyric overlays
+            # remain visible when cue edges align to cut edges.
+            if duration_ms > 0 and abs(shifted_end - start_ms) <= boundary_epsilon_ms:
+                rel_start = 0
+                rel_end = min(duration_ms, max(1, boundary_epsilon_ms))
+            elif duration_ms > 0 and abs(shifted_start - end_ms) <= boundary_epsilon_ms:
+                rel_end = duration_ms
+                rel_start = max(0, duration_ms - max(1, boundary_epsilon_ms))
+            else:
+                continue
+        block = [
+            str(out_idx),
+            f"{_format_ms_to_srt_timecode(rel_start)} --> {_format_ms_to_srt_timecode(rel_end)}",
+            *text_lines,
+            "",
+        ]
+        out_blocks.append("\n".join(block))
+        out_idx += 1
+
+    Path(output_path).write_text("\n".join(out_blocks), encoding="utf-8")
+    return bool(out_blocks)
+
+
+def _allow_empty_lyrics_srt() -> bool:
+    return os.environ.get("ALLOW_EMPTY_LYRICS_SRT", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pipeline_per_cut_render_enabled() -> bool:
+    return os.environ.get("PIPELINE_PER_CUT_RENDER", "0").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _count_srt_cues(path: str) -> int:
+    p = Path(path)
+    if not p.exists():
+        return 0
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    count = 0
+    for line in text.splitlines():
+        if "-->" not in line:
+            continue
+        parts = str(line).split("-->", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            _extract_srt_timecode_token(parts[0])
+            _extract_srt_timecode_token(parts[1])
+        except Exception:
+            continue
+        count += 1
+    return count
+
+
+def _require_nonempty_srt(path: str, *, label: str) -> int:
+    cue_count = _count_srt_cues(path)
+    if cue_count > 0 or _allow_empty_lyrics_srt():
+        return cue_count
+    raise RuntimeError(
+        f"{label} has zero subtitle cues at {path}. "
+        "Set ALLOW_EMPTY_LYRICS_SRT=1 to bypass this guardrail."
+    )
+
+
+def _should_fallback_to_legacy_full_render(*, main_lyrics_cues: int, cuts_with_lyrics: int) -> bool:
+    return (int(main_lyrics_cues) > 0) and (int(cuts_with_lyrics) <= 0) and (not _allow_empty_lyrics_srt())
 
 
 def _parse_ffmpeg_timestamp_to_seconds(value: str) -> float:
@@ -319,6 +554,73 @@ def _log_tail_excerpt(log_path: str, *, max_lines: int = 25, max_chars: int = 12
     if len(snippet) > max(80, int(max_chars)):
         snippet = snippet[-max_chars:]
     return snippet
+
+
+def _materialize_expected_video_output(
+    *,
+    expected_path: str,
+    log_path: str = "",
+    stage: str = "",
+) -> str:
+    expected = Path(expected_path)
+    if expected.exists():
+        return str(expected)
+
+    candidates: list[Path] = []
+    parent = expected.parent
+    stem = expected.stem
+    suffix = expected.suffix.lower()
+    video_exts = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
+
+    if parent.exists():
+        for p in sorted(parent.glob(f"{stem}*")):
+            if not p.is_file():
+                continue
+            if p == expected:
+                continue
+            ext = p.suffix.lower()
+            if ext == suffix or ext in video_exts:
+                candidates.append(p)
+
+    if log_path:
+        try:
+            log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            log_text = ""
+        for line in reversed(log_text.splitlines()):
+            m = re.search(r"(?:Saved|saved):\s*['\"]?([^'\"]+)", line)
+            if not m:
+                continue
+            raw = str(m.group(1) or "").strip()
+            if not raw:
+                continue
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                p = (parent / p).resolve()
+            if p.exists() and p.is_file() and p != expected:
+                candidates.append(p)
+                break
+
+    if not candidates:
+        return str(expected)
+
+    # Prefer the largest candidate to avoid selecting sidecar or stale partial files.
+    candidates = sorted(candidates, key=lambda p: (p.stat().st_size, p.stat().st_mtime), reverse=True)
+    chosen = candidates[0]
+    try:
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(chosen, expected)
+        print(
+            "render_output_reconciled "
+            f"stage={stage or 'unknown'} expected={expected} source={chosen}"
+        )
+        return str(expected)
+    except Exception as exc:
+        print(
+            "render_output_reconcile_failed "
+            f"stage={stage or 'unknown'} expected={expected} source={chosen} error={exc}"
+        )
+        return str(chosen)
 
 
 def _pick_cut_source_video(
@@ -799,15 +1101,21 @@ def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) ->
             _download_with_fallback(copy_id, copy_srt_path)
 
     clip_paths: list[str] = []
+    clip_specs_out: list[dict[str, str]] = []
     clip_specs = list(resolved_ids.get("clips") or [])
     for clip in clip_specs:
         drive_id = str(clip.get("drive_file_id") or "").strip()
         label = str(clip.get("label") or drive_id).strip()
+        category = _normalize_category_key(clip.get("category") or "")
         if not drive_id:
             continue
         clip_path = str(Path(paths["clips"]) / build_clip_filename(label, drive_id))
         _download_with_fallback(drive_id, clip_path)
         clip_paths.append(clip_path)
+        clip_spec_row = {"path": clip_path, "drive_file_id": drive_id, "label": label}
+        if category:
+            clip_spec_row["category"] = category
+        clip_specs_out.append(clip_spec_row)
 
     return {
         "paths": paths,
@@ -817,6 +1125,7 @@ def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) ->
         "lyrics_srt_path": lyrics_srt_path,
         "copy_srt_path": copy_srt_path,
         "clip_paths": clip_paths,
+        "clip_specs": clip_specs_out,
     }
 
 
@@ -919,12 +1228,14 @@ def run_once() -> int:
         elif renderer == "vse_text":
             _require_job_field(job, "input_video_path", renderer=renderer)
             _require_job_field(job, "input_audio_path", renderer=renderer)
-            _require_job_field(job, "input_srt_path", renderer=renderer)
+            srt_path = _require_job_field(job, "input_srt_path", renderer=renderer)
             _require_job_field(job, "preset", renderer=renderer)
             _require_job_field(job, "fps", renderer=renderer)
             _require_job_field(job, "aspect", renderer=renderer)
             _require_job_field(job, "bg_mode", renderer=renderer)
             output_mp4_path = _require_job_field(job, "output_local_path", renderer=renderer)
+            cue_count = _require_nonempty_srt(srt_path, label="renderer=vse_text input_srt_path")
+            print(f"lyrics_srt_cues={cue_count} label=vse_text path={srt_path}")
 
             blender_bin = os.environ.get("BLENDER_BIN", "").strip() or DEFAULT_BLENDER_BIN
             cmd = build_vse_text_command(job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
@@ -1010,6 +1321,11 @@ def run_once() -> int:
             paths = resolved["paths"]
             manifest = resolved["manifest"]
             stage_plan = plan_pipeline_v1_stages(manifest, resolved)
+            main_lyrics_cues = _require_nonempty_srt(
+                str(resolved["lyrics_srt_path"]),
+                label="renderer=pipeline_v1 lyrics_srt_path",
+            )
+            print(f"lyrics_srt_cues={main_lyrics_cues} label=pipeline_v1_main path={resolved['lyrics_srt_path']}")
             cuts = manifest.get("cuts", []) if isinstance(manifest, dict) else []
             normalized_cuts = [c for c in cuts if isinstance(c, dict)] if isinstance(cuts, list) else []
             max_cut_end_s = (
@@ -1025,154 +1341,439 @@ def run_once() -> int:
             blender_stage_retries = _to_int(os.environ.get("PIPELINE_BLENDER_STAGE_RETRIES", "1"), 1)
             blender_retry_delay_s = float(os.environ.get("PIPELINE_BLENDER_RETRY_DELAY_SECONDS", "1"))
 
-            base_mp4 = str(Path(paths["outputs"]) / "base.mp4")
-            lyrics_mp4 = str(Path(paths["outputs"]) / "lyrics.mp4")
-            final_mp4 = lyrics_mp4
+            per_cut_render = _pipeline_per_cut_render_enabled()
 
-            stitch_job = {
-                "media_root_path": _build_stitcher_media_root(
-                    resolved["clip_paths"],
-                    paths["clips"],
-                    stitch_preset=str(job.get("stitch_preset") or ""),
-                ),
-                "input_audio_path": resolved["audio_path"],
-                "fps": str(job.get("fps") or ""),
-                "aspect": str(job.get("aspect") or ""),
-                "stitch_preset": str(job.get("stitch_preset") or ""),
-                "bpm": str(job.get("bpm") or manifest.get("stitch", {}).get("bpm") or ""),
-                "seed": str(job.get("seed") or ""),
-                "output_local_path": base_mp4,
-                "render_end_seconds": render_end_seconds,
-            }
-            stitch_log = str(Path(paths["logs"]) / "stitch.log")
-            stitch_cmd = build_vse_stitcher_command(stitch_job, blender_bin=blender_bin, script_path=VSE_STITCHER_SCRIPT_PATH)
-            try:
-                _run_to_log(
-                    stitch_cmd,
-                    stitch_log,
-                    stage="stitch",
-                    retries=blender_stage_retries,
-                    retry_delay_seconds=blender_retry_delay_s,
-                )
-            except Exception as stitch_exc:
-                allow_stitch_fallback = os.environ.get("PIPELINE_STITCH_FALLBACK_COPY_FIRST", "1").strip() == "1"
-                if not allow_stitch_fallback:
-                    raise
-                if not resolved["clip_paths"]:
-                    raise
-                shutil.copy2(resolved["clip_paths"][0], base_mp4)
-                with Path(stitch_log).open("a", encoding="utf-8") as lf:
-                    lf.write("\n")
-                    lf.write(f"stitch_fallback=copy_first_clip reason={stitch_exc}\n")
-            if not Path(base_mp4).exists() and resolved["clip_paths"]:
-                shutil.copy2(resolved["clip_paths"][0], base_mp4)
-                with Path(stitch_log).open("a", encoding="utf-8") as lf:
-                    lf.write("\n")
-                    lf.write("stitch_fallback=copy_first_clip reason=missing_base_output\n")
+            def _run_pipeline_full_length() -> tuple[str, str, str, str, str, str, list[str], list[str]]:
+                base_mp4_local = str(Path(paths["outputs"]) / "base.mp4")
+                lyrics_mp4_local = str(Path(paths["outputs"]) / "lyrics.mp4")
+                final_mp4_local = lyrics_mp4_local
+                stitch_log_local = str(Path(paths["logs"]) / "stitch.log")
+                lyrics_log_local = str(Path(paths["logs"]) / "lyrics.log")
+                copy_log_local = ""
 
-            lyrics_job = {
-                "input_video_path": base_mp4,
-                "input_srt_path": resolved["lyrics_srt_path"],
-                "input_audio_path": resolved["audio_path"],
-                "fps": str(job.get("fps") or ""),
-                "aspect": str(job.get("aspect") or ""),
-                "preset": str(job.get("preset") or ""),
-                "bg_mode": str(job.get("bg_mode") or ""),
-                "output_local_path": lyrics_mp4,
-                "render_end_seconds": render_end_seconds,
-            }
-            lyrics_log = str(Path(paths["logs"]) / "lyrics.log")
-            lyrics_cmd = build_vse_text_command(lyrics_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
-            _run_to_log(
-                lyrics_cmd,
-                lyrics_log,
-                stage="lyrics",
-                retries=blender_stage_retries,
-                retry_delay_seconds=blender_retry_delay_s,
-            )
-            if not Path(lyrics_mp4).exists():
-                shutil.copy2(base_mp4, lyrics_mp4)
-                with Path(lyrics_log).open("a", encoding="utf-8") as lf:
-                    lf.write("\n")
-                    lf.write("lyrics_fallback=copy_base reason=missing_lyrics_output\n")
+                stitch_job = {
+                    "media_root_path": _build_stitcher_media_root(
+                        list(resolved.get("clip_specs") or resolved.get("clip_paths") or []),
+                        paths["clips"],
+                        stitch_preset=str(job.get("stitch_preset") or ""),
+                    ),
+                    "input_audio_path": resolved["audio_path"],
+                    "fps": str(job.get("fps") or ""),
+                    "aspect": str(job.get("aspect") or ""),
+                    "stitch_preset": str(job.get("stitch_preset") or ""),
+                    "bpm": str(job.get("bpm") or manifest.get("stitch", {}).get("bpm") or ""),
+                    "seed": str(job.get("seed") or ""),
+                    "output_local_path": base_mp4_local,
+                    "render_end_seconds": render_end_seconds,
+                }
+                stitch_cmd = build_vse_stitcher_command(stitch_job, blender_bin=blender_bin, script_path=VSE_STITCHER_SCRIPT_PATH)
+                try:
+                    _run_to_log(
+                        stitch_cmd,
+                        stitch_log_local,
+                        stage="stitch",
+                        retries=blender_stage_retries,
+                        retry_delay_seconds=blender_retry_delay_s,
+                    )
+                except Exception as stitch_exc:
+                    allow_stitch_fallback = os.environ.get("PIPELINE_STITCH_FALLBACK_COPY_FIRST", "1").strip() == "1"
+                    if not allow_stitch_fallback:
+                        raise
+                    if not resolved["clip_paths"]:
+                        raise
+                    shutil.copy2(resolved["clip_paths"][0], base_mp4_local)
+                    with Path(stitch_log_local).open("a", encoding="utf-8") as lf:
+                        lf.write("\n")
+                        lf.write(f"stitch_fallback=copy_first_clip reason={stitch_exc}\n")
+                if not Path(base_mp4_local).exists() and resolved["clip_paths"]:
+                    shutil.copy2(resolved["clip_paths"][0], base_mp4_local)
+                    with Path(stitch_log_local).open("a", encoding="utf-8") as lf:
+                        lf.write("\n")
+                        lf.write("stitch_fallback=copy_first_clip reason=missing_base_output\n")
 
-            copy_log = ""
-            if "copy" in stage_plan:
-                final_mp4 = str(Path(paths["outputs"]) / "final.mp4")
-                copy_job = {
-                    "input_video_path": lyrics_mp4,
-                    "input_srt_path": resolved["copy_srt_path"],
+                lyrics_job = {
+                    "input_video_path": base_mp4_local,
+                    "input_srt_path": resolved["lyrics_srt_path"],
                     "input_audio_path": resolved["audio_path"],
                     "fps": str(job.get("fps") or ""),
                     "aspect": str(job.get("aspect") or ""),
                     "preset": str(job.get("preset") or ""),
                     "bg_mode": str(job.get("bg_mode") or ""),
-                    "output_local_path": final_mp4,
+                    "output_local_path": lyrics_mp4_local,
                     "render_end_seconds": render_end_seconds,
                 }
-                copy_log = str(Path(paths["logs"]) / "copy.log")
-                copy_cmd = build_vse_text_command(copy_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
+                lyrics_cmd = build_vse_text_command(lyrics_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
                 _run_to_log(
-                    copy_cmd,
-                    copy_log,
-                    stage="copy",
+                    lyrics_cmd,
+                    lyrics_log_local,
+                    stage="lyrics",
                     retries=blender_stage_retries,
                     retry_delay_seconds=blender_retry_delay_s,
                 )
+                if not Path(lyrics_mp4_local).exists():
+                    if main_lyrics_cues > 0 and not _allow_empty_lyrics_srt():
+                        raise RuntimeError(
+                            "pipeline_v1 legacy full-length lyrics stage produced no output despite non-empty lyrics SRT."
+                        )
+                    shutil.copy2(base_mp4_local, lyrics_mp4_local)
+                    with Path(lyrics_log_local).open("a", encoding="utf-8") as lf:
+                        lf.write("\n")
+                        lf.write("lyrics_fallback=copy_base reason=missing_lyrics_output\n")
 
-            # Some preset/script combinations can report success while not materializing lyrics output.
-            # Keep pipeline moving by falling back to stitch output for cut extraction.
-            if not Path(final_mp4).exists():
-                final_mp4 = base_mp4
-            source_label = "copy" if copy_log else "lyrics"
-            source_log = copy_log or lyrics_log
-            selected_source = _pick_cut_source_video(
-                base_mp4=base_mp4,
-                candidate_mp4=final_mp4,
-                max_cut_end_s=max_cut_end_s,
-                candidate_label=source_label,
-                candidate_log_path=source_log,
-            )
-            if selected_source != final_mp4:
-                with Path(source_log).open("a", encoding="utf-8") as lf:
-                    lf.write("\n")
-                    lf.write(
-                        "video_fallback=use_base_for_cuts reason=short_overlay_output "
-                        f"required_cut_end_s={max_cut_end_s:.3f}\n"
+                if "copy" in stage_plan:
+                    final_mp4_local = str(Path(paths["outputs"]) / "final.mp4")
+                    copy_job = {
+                        "input_video_path": lyrics_mp4_local,
+                        "input_srt_path": resolved["copy_srt_path"],
+                        "input_audio_path": resolved["audio_path"],
+                        "fps": str(job.get("fps") or ""),
+                        "aspect": str(job.get("aspect") or ""),
+                        "preset": str(job.get("preset") or ""),
+                        "bg_mode": str(job.get("bg_mode") or ""),
+                        "output_local_path": final_mp4_local,
+                        "render_end_seconds": render_end_seconds,
+                    }
+                    copy_log_local = str(Path(paths["logs"]) / "copy.log")
+                    copy_cmd = build_vse_text_command(copy_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
+                    _run_to_log(
+                        copy_cmd,
+                        copy_log_local,
+                        stage="copy",
+                        retries=blender_stage_retries,
+                        retry_delay_seconds=blender_retry_delay_s,
                     )
-                final_mp4 = selected_source
+
+                # Some preset/script combinations can report success while not materializing lyrics output.
+                # Keep pipeline moving by falling back to stitch output for cut extraction.
+                if not Path(final_mp4_local).exists():
+                    if Path(lyrics_mp4_local).exists():
+                        final_mp4_local = lyrics_mp4_local
+                    elif main_lyrics_cues > 0 and not _allow_empty_lyrics_srt():
+                        raise RuntimeError(
+                            "pipeline_v1 legacy full-length pipeline produced no usable lyrics/copy overlay output."
+                        )
+                    else:
+                        final_mp4_local = base_mp4_local
+                source_label = "copy" if copy_log_local else "lyrics"
+                source_log = copy_log_local or lyrics_log_local
+                selected_source = _pick_cut_source_video(
+                    base_mp4=base_mp4_local,
+                    candidate_mp4=final_mp4_local,
+                    max_cut_end_s=max_cut_end_s,
+                    candidate_label=source_label,
+                    candidate_log_path=source_log,
+                )
+                if selected_source != final_mp4_local:
+                    with Path(source_log).open("a", encoding="utf-8") as lf:
+                        lf.write("\n")
+                        lf.write(
+                            "video_fallback=use_base_for_cuts reason=short_overlay_output "
+                            f"required_cut_end_s={max_cut_end_s:.3f}\n"
+                        )
+                    if main_lyrics_cues > 0 and not _allow_empty_lyrics_srt():
+                        raise RuntimeError(
+                            "pipeline_v1 legacy full-length overlay output was shorter than required cut horizon "
+                            "despite non-empty lyrics cues."
+                        )
+                    final_mp4_local = selected_source
+
+                cut_logs_local: list[str] = []
+                shorts_local: list[str] = []
+                if isinstance(cuts, list):
+                    if normalized_cuts:
+                        source_duration = _probe_media_duration_seconds(final_mp4_local)
+                        # If source media is unexpectedly short, fail fast instead of silently producing one-frame outputs.
+                        if max_cut_end_s > (source_duration + 0.05):
+                            raise RuntimeError(
+                                "pipeline_v1 cut range exceeds rendered media duration "
+                                f"(duration_s={source_duration:.3f} max_cut_end_s={max_cut_end_s:.3f} source={final_mp4_local})."
+                            )
+                    for i, cut in enumerate(cuts, start=1):
+                        if not isinstance(cut, dict):
+                            continue
+                        start_tc = str(cut.get("start") or "").strip()
+                        end_tc = str(cut.get("end") or "").strip()
+                        filename = str(cut.get("filename") or f"short_{i:02d}.mp4").strip()
+                        if not start_tc or not end_tc or not filename:
+                            continue
+                        out_short = str(Path(paths["outputs"]) / filename)
+                        cut_log = str(Path(paths["logs"]) / f"cut_{i:02d}.log")
+                        cut_cmd = build_ffmpeg_cut_command(
+                            ffmpeg_bin=ffmpeg_bin,
+                            input_path=final_mp4_local,
+                            start=start_tc,
+                            end=end_tc,
+                            output_path=out_short,
+                        )
+                        _run_to_log(cut_cmd, cut_log, stage=f"cut:{filename}")
+                        shorts_local.append(out_short)
+                        cut_logs_local.append(cut_log)
+                return (
+                    base_mp4_local,
+                    lyrics_mp4_local,
+                    final_mp4_local,
+                    stitch_log_local,
+                    lyrics_log_local,
+                    copy_log_local,
+                    shorts_local,
+                    cut_logs_local,
+                )
 
             cut_logs: list[str] = []
             shorts: list[str] = []
-            if isinstance(cuts, list):
-                if normalized_cuts:
-                    source_duration = _probe_media_duration_seconds(final_mp4)
-                    # If source media is unexpectedly short, fail fast instead of silently producing one-frame outputs.
-                    if max_cut_end_s > (source_duration + 0.05):
-                        raise RuntimeError(
-                            "pipeline_v1 cut range exceeds rendered media duration "
-                            f"(duration_s={source_duration:.3f} max_cut_end_s={max_cut_end_s:.3f} source={final_mp4})."
-                        )
-                for i, cut in enumerate(cuts, start=1):
-                    if not isinstance(cut, dict):
-                        continue
+
+            # Exposed as top-level artifacts for backward compatibility.
+            base_mp4 = str(Path(paths["outputs"]) / "base.mp4")
+            lyrics_mp4 = str(Path(paths["outputs"]) / "lyrics.mp4")
+            final_mp4 = str(Path(paths["outputs"]) / "final.mp4")
+            stitch_log = str(Path(paths["logs"]) / "stitch.log")
+            lyrics_log = str(Path(paths["logs"]) / "lyrics.log")
+            copy_log = str(Path(paths["logs"]) / "copy.log") if "copy" in stage_plan else ""
+
+            if per_cut_render and normalized_cuts:
+                print("pipeline_v1_mode=per_cut")
+                media_root_cache: dict[str, str] = {}
+                have_primary = False
+                cuts_with_lyrics = 0
+
+                for i, cut in enumerate(normalized_cuts, start=1):
                     start_tc = str(cut.get("start") or "").strip()
                     end_tc = str(cut.get("end") or "").strip()
                     filename = str(cut.get("filename") or f"short_{i:02d}.mp4").strip()
                     if not start_tc or not end_tc or not filename:
                         continue
-                    out_short = str(Path(paths["outputs"]) / filename)
-                    cut_log = str(Path(paths["logs"]) / f"cut_{i:02d}.log")
-                    cut_cmd = build_ffmpeg_cut_command(
+                    start_s = _parse_ffmpeg_timestamp_to_seconds(start_tc)
+                    end_s = _parse_ffmpeg_timestamp_to_seconds(end_tc)
+                    if end_s <= start_s:
+                        raise RuntimeError(f"Invalid cut range for {filename}: start={start_tc} end={end_tc}")
+                    cut_duration_s = end_s - start_s
+                    rel_end_tc = _format_seconds_to_ffmpeg_timestamp(cut_duration_s)
+
+                    cut_stitch_preset = str(cut.get("stitch_preset") or job.get("stitch_preset") or "").strip()
+                    cut_text_preset = str(cut.get("text_preset") or job.get("preset") or "").strip()
+                    cut_seed = str(cut.get("seed") or job.get("seed") or "").strip()
+                    cut_fps = str(cut.get("fps") or job.get("fps") or "").strip()
+                    cut_aspect = str(cut.get("aspect") or job.get("aspect") or "").strip()
+                    cut_bg_mode = str(cut.get("bg_mode") or job.get("bg_mode") or "").strip()
+                    cut_bpm = str(job.get("bpm") or manifest.get("stitch", {}).get("bpm") or "").strip()
+
+                    media_key = re.sub(r"[^a-z0-9]+", "_", cut_stitch_preset.lower()) or "default"
+                    media_root = media_root_cache.get(media_key, "")
+                    if not media_root:
+                        media_root = _build_stitcher_media_root(
+                            list(resolved.get("clip_specs") or resolved.get("clip_paths") or []),
+                            str(Path(paths["clips"]) / f"preset_{media_key}"),
+                            stitch_preset=cut_stitch_preset,
+                        )
+                        media_root_cache[media_key] = media_root
+
+                    cut_prefix = f"cut_{i:02d}"
+                    cut_audio_path = str(Path(paths["inputs"]) / f"{cut_prefix}_audio.wav")
+                    cut_lyrics_srt_path = str(Path(paths["inputs"]) / f"{cut_prefix}_lyrics.srt")
+                    cut_copy_srt_path = str(Path(paths["inputs"]) / f"{cut_prefix}_copy.srt")
+
+                    cut_audio_log = str(Path(paths["logs"]) / f"{cut_prefix}_audio.log")
+                    cut_audio_cmd = build_ffmpeg_audio_trim_command(
                         ffmpeg_bin=ffmpeg_bin,
-                        input_path=final_mp4,
+                        input_path=resolved["audio_path"],
                         start=start_tc,
                         end=end_tc,
+                        output_path=cut_audio_path,
+                    )
+                    _run_to_log(cut_audio_cmd, cut_audio_log, stage=f"cut_audio:{filename}")
+
+                    _slice_and_shift_srt_file(
+                        input_path=resolved["lyrics_srt_path"],
+                        output_path=cut_lyrics_srt_path,
+                        start_s=start_s,
+                        end_s=end_s,
+                    )
+                    cut_lyrics_cues = _count_srt_cues(cut_lyrics_srt_path)
+                    has_lyrics_for_cut = cut_lyrics_cues > 0
+                    print(
+                        f"per_cut_lyrics_srt cut_idx={i} filename={filename} "
+                        f"cue_count={cut_lyrics_cues} start_s={start_s:.3f} end_s={end_s:.3f}"
+                    )
+                    if has_lyrics_for_cut:
+                        cuts_with_lyrics += 1
+                    has_copy_for_cut = False
+                    if "copy" in stage_plan and resolved.get("copy_srt_path"):
+                        has_copy_for_cut = _slice_and_shift_srt_file(
+                            input_path=str(resolved["copy_srt_path"]),
+                            output_path=cut_copy_srt_path,
+                            start_s=start_s,
+                            end_s=end_s,
+                        )
+
+                    cut_render_end = max(0.0, cut_duration_s + render_end_padding_s)
+                    cut_base_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_base.mp4")
+                    cut_lyrics_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_lyrics.mp4")
+                    cut_final_stage_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_final.mp4")
+                    cut_stitch_log = str(Path(paths["logs"]) / f"{cut_prefix}_stitch.log")
+                    cut_lyrics_log = str(Path(paths["logs"]) / f"{cut_prefix}_lyrics.log")
+                    cut_copy_log = str(Path(paths["logs"]) / f"{cut_prefix}_copy.log")
+
+                    stitch_job = {
+                        "media_root_path": media_root,
+                        "input_audio_path": cut_audio_path,
+                        "fps": cut_fps,
+                        "aspect": cut_aspect,
+                        "stitch_preset": cut_stitch_preset,
+                        "bpm": cut_bpm,
+                        "seed": cut_seed,
+                        "output_local_path": cut_base_mp4,
+                        "render_end_seconds": cut_render_end,
+                    }
+                    stitch_cmd = build_vse_stitcher_command(
+                        stitch_job,
+                        blender_bin=blender_bin,
+                        script_path=VSE_STITCHER_SCRIPT_PATH,
+                    )
+                    try:
+                        _run_to_log(
+                            stitch_cmd,
+                            cut_stitch_log,
+                            stage=f"stitch:{filename}",
+                            retries=blender_stage_retries,
+                            retry_delay_seconds=blender_retry_delay_s,
+                        )
+                    except Exception as stitch_exc:
+                        allow_stitch_fallback = os.environ.get("PIPELINE_STITCH_FALLBACK_COPY_FIRST", "1").strip() == "1"
+                        if not allow_stitch_fallback:
+                            raise
+                        if not resolved["clip_paths"]:
+                            raise
+                        shutil.copy2(resolved["clip_paths"][0], cut_base_mp4)
+                        with Path(cut_stitch_log).open("a", encoding="utf-8") as lf:
+                            lf.write("\n")
+                            lf.write(f"stitch_fallback=copy_first_clip reason={stitch_exc}\n")
+                    if not Path(cut_base_mp4).exists() and resolved["clip_paths"]:
+                        shutil.copy2(resolved["clip_paths"][0], cut_base_mp4)
+                        with Path(cut_stitch_log).open("a", encoding="utf-8") as lf:
+                            lf.write("\n")
+                            lf.write("stitch_fallback=copy_first_clip reason=missing_base_output\n")
+
+                    lyrics_job = {
+                        "input_video_path": cut_base_mp4,
+                        "input_srt_path": cut_lyrics_srt_path,
+                        "input_audio_path": cut_audio_path,
+                        "fps": cut_fps,
+                        "aspect": cut_aspect,
+                        "preset": cut_text_preset,
+                        "bg_mode": cut_bg_mode,
+                        "output_local_path": cut_lyrics_mp4,
+                        "render_end_seconds": cut_render_end,
+                    }
+                    if has_lyrics_for_cut:
+                        lyrics_cmd = build_vse_text_command(
+                            lyrics_job,
+                            blender_bin=blender_bin,
+                            script_path=VSE_TEXT_SCRIPT_PATH,
+                        )
+                        _run_to_log(
+                            lyrics_cmd,
+                            cut_lyrics_log,
+                            stage=f"lyrics:{filename}",
+                            retries=blender_stage_retries,
+                            retry_delay_seconds=blender_retry_delay_s,
+                        )
+                        if not Path(cut_lyrics_mp4).exists():
+                            shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
+                            with Path(cut_lyrics_log).open("a", encoding="utf-8") as lf:
+                                lf.write("\n")
+                                lf.write("lyrics_fallback=copy_base reason=missing_lyrics_output\n")
+                    else:
+                        shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
+                        Path(cut_lyrics_log).write_text(
+                            "lyrics_fallback=copy_base reason=empty_lyrics_srt\n",
+                            encoding="utf-8",
+                        )
+
+                    selected_cut_source = cut_lyrics_mp4
+                    selected_copy_log = ""
+                    if "copy" in stage_plan and has_copy_for_cut:
+                        copy_job = {
+                            "input_video_path": cut_lyrics_mp4,
+                            "input_srt_path": cut_copy_srt_path,
+                            "input_audio_path": cut_audio_path,
+                            "fps": cut_fps,
+                            "aspect": cut_aspect,
+                            "preset": cut_text_preset,
+                            "bg_mode": cut_bg_mode,
+                            "output_local_path": cut_final_stage_mp4,
+                            "render_end_seconds": cut_render_end,
+                        }
+                        copy_cmd = build_vse_text_command(
+                            copy_job,
+                            blender_bin=blender_bin,
+                            script_path=VSE_TEXT_SCRIPT_PATH,
+                        )
+                        _run_to_log(
+                            copy_cmd,
+                            cut_copy_log,
+                            stage=f"copy:{filename}",
+                            retries=blender_stage_retries,
+                            retry_delay_seconds=blender_retry_delay_s,
+                        )
+                        if Path(cut_final_stage_mp4).exists():
+                            selected_cut_source = cut_final_stage_mp4
+                            selected_copy_log = cut_copy_log
+
+                    out_short = str(Path(paths["outputs"]) / filename)
+                    cut_log = str(Path(paths["logs"]) / f"{cut_prefix}.log")
+                    cut_cmd = build_ffmpeg_cut_command(
+                        ffmpeg_bin=ffmpeg_bin,
+                        input_path=selected_cut_source,
+                        start="00:00:00.000",
+                        end=rel_end_tc,
                         output_path=out_short,
                     )
                     _run_to_log(cut_cmd, cut_log, stage=f"cut:{filename}")
                     shorts.append(out_short)
                     cut_logs.append(cut_log)
+
+                    if not have_primary:
+                        have_primary = True
+                        base_mp4 = cut_base_mp4
+                        lyrics_mp4 = cut_lyrics_mp4
+                        final_mp4 = selected_cut_source
+                        stitch_log = cut_stitch_log
+                        lyrics_log = cut_lyrics_log
+                        copy_log = selected_copy_log
+
+                if not have_primary:
+                    raise RuntimeError("pipeline_v1 per-cut mode found no usable cuts to render.")
+                if _should_fallback_to_legacy_full_render(
+                    main_lyrics_cues=main_lyrics_cues,
+                    cuts_with_lyrics=cuts_with_lyrics,
+                ):
+                    print(
+                        "per_cut_lyrics_empty_fallback=legacy_full_render "
+                        f"main_lyrics_cues={main_lyrics_cues} cuts_with_lyrics={cuts_with_lyrics}"
+                    )
+                    print("pipeline_v1_mode=legacy_full_length reason=per_cut_zero_lyrics")
+                    (
+                        base_mp4,
+                        lyrics_mp4,
+                        final_mp4,
+                        stitch_log,
+                        lyrics_log,
+                        copy_log,
+                        shorts,
+                        cut_logs,
+                    ) = _run_pipeline_full_length()
+            else:
+                print("pipeline_v1_mode=legacy_full_length")
+                (
+                    base_mp4,
+                    lyrics_mp4,
+                    final_mp4,
+                    stitch_log,
+                    lyrics_log,
+                    copy_log,
+                    shorts,
+                    cut_logs,
+                ) = _run_pipeline_full_length()
 
             created = _utc_now_iso()
             campaign_id = str(job.get("campaign_id") or "")

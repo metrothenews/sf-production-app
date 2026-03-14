@@ -32,6 +32,23 @@ def test_normalize_text_preset_name() -> None:
     assert compiler._normalize_text_preset_name("") == ""
 
 
+def test_resolve_stitch_bpm_prefers_song_bpm_column() -> None:
+    cfg = {"Song BPM": "136", "BPM": "120"}
+    assert compiler.resolve_stitch_bpm(cfg) == 136.0
+
+
+def test_resolve_stitch_bpm_falls_back_to_env(monkeypatch) -> None:
+    monkeypatch.setenv("PIPELINE_STITCH_BPM", "128")
+    assert compiler.resolve_stitch_bpm({}) == 128.0
+
+
+def test_resolve_stitch_bpm_rejects_invalid_value() -> None:
+    import pytest
+
+    with pytest.raises(RuntimeError, match=r"Invalid BPM value"):
+        compiler.resolve_stitch_bpm({"Song BPM": "abc"})
+
+
 def test_read_preset_rows_from_sheet1_layout() -> None:
     class _FakeGateway:
         def read(self, _sheet_id: str, _ranges: list[str]):
@@ -99,15 +116,17 @@ def test_non_multiple_video_count_trims_last_iteration() -> None:
     assert sum(run_cut_counts) == number_of_videos
 
 
-def test_collection_pool_for_run_alternates_across_1_to_4() -> None:
+def test_collection_pool_for_run_alternates_across_1_to_6() -> None:
     pools = [
         {"collection_num": "1"},
         {"collection_num": "2"},
         {"collection_num": "3"},
         {"collection_num": "4"},
+        {"collection_num": "5"},
+        {"collection_num": "6"},
     ]
-    seq = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(10)]
-    assert seq == ["1", "2", "3", "4", "1", "2", "3", "4", "1", "2"]
+    seq = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(14)]
+    assert seq == ["1", "2", "3", "4", "5", "6", "1", "2", "3", "4", "5", "6", "1", "2"]
 
 
 def test_collection_alternation_is_per_full_length_run_not_per_cut() -> None:
@@ -131,9 +150,11 @@ def test_collection_alternation_is_per_full_length_run_not_per_cut() -> None:
         {"collection_num": "2"},
         {"collection_num": "3"},
         {"collection_num": "4"},
+        {"collection_num": "5"},
+        {"collection_num": "6"},
     ]
     run_sequence = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(required_runs)]
-    assert run_sequence == ["1", "2", "3", "4", "1", "2", "3", "4", "1"]
+    assert run_sequence == ["1", "2", "3", "4", "5", "6", "1", "2", "3"]
 
 
 def test_collection_pool_for_run_errors_on_invalid_input() -> None:

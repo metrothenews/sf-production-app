@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -224,6 +227,19 @@ class Cue:
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+_SRT_BREAK_RE = re.compile(r"(?is)<\s*br\s*/?\s*>")
+
+# Temporary global timing tweak: render lyrics 0.5s earlier than cue timestamps.
+# Keep this centralized so we can tune/remove it later.
+HARDCODED_LYRIC_ADVANCE_MS = 500
+
+
+def _normalize_srt_linebreak_tokens(s: str) -> str:
+    # Common subtitle line-break encodings from different exporters.
+    out = str(s or "")
+    out = _SRT_BREAK_RE.sub("\n", out)  # <br>, <br/>, <BR />
+    out = out.replace("\\N", "\n").replace("\\n", "\n")
+    return out
 
 
 def _parse_timecode_to_ms(tc: str) -> int:
@@ -315,11 +331,13 @@ def normalize_cues(
     else:
         raise ValueError(f"Unknown srt_origin {origin!r}.")
 
-    shift = int(base_shift) + int(offset_ms)
+    # Positive offset_ms delays subtitles; negative advances them.
+    # Apply a temporary global advance to counter observed on-screen lag.
+    shift = int(base_shift) + int(offset_ms) - int(HARDCODED_LYRIC_ADVANCE_MS)
 
     out: List[Cue] = []
     for c in cues:
-        txt = c.text
+        txt = _normalize_srt_linebreak_tokens(c.text)
         if strip_tags:
             txt = _TAG_RE.sub("", txt).strip()
         if text_transform == "lower":
@@ -893,6 +911,9 @@ def add_text_effect(
         frame_end=int(frame_end_excl),
     )
     try_set(st, "text", text)
+    # Keep TEXT strips composited over the base video across Blender versions.
+    try_set(st, "blend_type", "ALPHA_OVER")
+    try_set(st, "blend_alpha", 1.0)
     return st
 
 
@@ -946,13 +967,17 @@ def apply_text_style(
     try_set(strip, "outline_width", int(outline))
     try_set(strip, "shadow", int(shadow))
 
-    # Color / opacity properties vary
+    # Color / alpha properties vary by Blender version/build.
     if hasattr(strip, "color"):
         try:
             strip.color = (float(text_rgb[0]), float(text_rgb[1]), float(text_rgb[2]), float(text_alpha))
         except Exception:
-            pass
-    try_set(strip, "opacity", float(text_alpha))
+            try:
+                strip.color = (float(text_rgb[0]), float(text_rgb[1]), float(text_rgb[2]))
+            except Exception:
+                pass
+    for attr in ("opacity", "alpha", "text_alpha", "blend_alpha"):
+        try_set(strip, attr, float(text_alpha))
 
 
 # ----------------------------
@@ -1084,6 +1109,25 @@ def _reflow_words_to_lines(words: List[str], *, max_width_chars: int, fixed_line
     return "\n".join(out_lines)
 
 
+def _wrap_lines_to_width(s: str, *, max_width_chars: int) -> str:
+    out_lines: List[str] = []
+    for raw_ln in s.splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        wrapped = textwrap.wrap(
+            ln,
+            width=max(1, int(max_width_chars)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if wrapped:
+            out_lines.extend(wrapped)
+        else:
+            out_lines.append(ln)
+    return "\n".join(out_lines)
+
+
 def preprocess_text_for_manual_layout(
     s: str,
     *,
@@ -1100,16 +1144,21 @@ def preprocess_text_for_manual_layout(
         s = _collapse_lines(s)
 
     mode = cfg.linebreak_mode
+    wrap_px = _manual_wrap_width_px(scene, safe_margin, cfg)
+    approx_char_w = max(1.0, float(font_size) * float(cfg.approx_char_width_factor))
+    max_chars = max(8, int((wrap_px or 600.0) / approx_char_w))
+
     if mode == "srt":
+        # Preserve authored line breaks, but enforce a max width so long cues
+        # cannot push words outside the safe frame bounds.
+        if any(len(ln.strip()) > max_chars for ln in s.splitlines()):
+            return _wrap_lines_to_width(s, max_width_chars=max_chars)
         return s
 
     words = [w for w in re.split(r"\s+", s.strip()) if w]
     if not words:
         return ""
 
-    wrap_px = _manual_wrap_width_px(scene, safe_margin, cfg)
-    approx_char_w = max(1.0, float(font_size) * float(cfg.approx_char_width_factor))
-    max_chars = max(8, int((wrap_px or 600.0) / approx_char_w))
     reflowed = _reflow_words_to_lines(words, max_width_chars=max_chars, fixed_lines=cfg.fixed_lines)
 
     if mode == "reflow":
@@ -1375,8 +1424,125 @@ def pick_channel_block(
     )
 
 
-def render_animation(scene: bpy.types.Scene) -> None:
-    bpy.ops.render.render(animation=True)
+def render_animation(
+    scene: bpy.types.Scene,
+    *,
+    output_path: str,
+    fps: int,
+    audio_path: str = "",
+) -> None:
+    out_path = Path(output_path).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    start = int(getattr(scene, "frame_start", 1) or 1)
+    end = int(getattr(scene, "frame_end", start) or start)
+    if end < start:
+        raise RuntimeError(f"Invalid render frame range: start={start} end={end}")
+
+    scene.render.use_sequencer = True
+
+    # Avoid Blender FFmpeg movie writer edge-cases by rendering PNGs then muxing with ffmpeg.
+    frames_dir = Path(tempfile.mkdtemp(prefix="vse_text_frames_"))
+    scene.render.filepath = str(frames_dir / "frame_")
+    scene.render.image_settings.file_format = "PNG"
+    if hasattr(scene.render.image_settings, "color_mode"):
+        scene.render.image_settings.color_mode = "RGB"
+    if hasattr(scene.render.image_settings, "color_depth"):
+        scene.render.image_settings.color_depth = "8"
+
+    view_layer = scene.view_layers[0] if scene.view_layers else bpy.context.view_layer
+    try:
+        with bpy.context.temp_override(scene=scene, view_layer=view_layer):
+            bpy.ops.render.render(animation=True, use_viewport=False)
+
+        frame_glob = sorted(frames_dir.glob("frame_*.png"))
+        if not frame_glob:
+            raise RuntimeError(f"No PNG frames rendered under {frames_dir}")
+
+        ffmpeg_cmd: List[str] = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(int(fps)),
+            "-start_number",
+            str(int(start)),
+            "-i",
+            str(frames_dir / "frame_%04d.png"),
+        ]
+        if audio_path:
+            audio = Path(audio_path).expanduser().resolve()
+            if audio.exists():
+                ffmpeg_cmd.extend(
+                    [
+                        "-i",
+                        str(audio),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-r",
+                        str(int(fps)),
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        "-movflags",
+                        "+faststart",
+                        str(out_path),
+                    ]
+                )
+            else:
+                ffmpeg_cmd.extend(
+                    [
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-r",
+                        str(int(fps)),
+                        "-an",
+                        "-movflags",
+                        "+faststart",
+                        str(out_path),
+                    ]
+                )
+        else:
+            ffmpeg_cmd.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    str(int(fps)),
+                    "-an",
+                    "-movflags",
+                    "+faststart",
+                    str(out_path),
+                ]
+            )
+
+        proc = subprocess.run(ffmpeg_cmd, check=False, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg mux failed for text output: "
+                f"code={proc.returncode} stderr={(proc.stderr or '').strip()}"
+            )
+    finally:
+        try:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ----------------------------
@@ -1530,7 +1696,15 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
     blur_enable = bool(p["blur_enable"])
     blur_px = float(p["blur_px"])
     blur_off = int(p["blur_channel_offset"])
-    pix_cfg = dict(p.get("pixelate", {}))
+    pix_cfg_raw = p.get("pixelate", {})
+    if not isinstance(pix_cfg_raw, dict):
+        pix_cfg_raw = {}
+    # Backward compatibility: older presets use "pixelate_chain".
+    if not pix_cfg_raw:
+        chain = p.get("pixelate_chain", {})
+        if isinstance(chain, dict):
+            pix_cfg_raw = chain
+    pix_cfg = dict(pix_cfg_raw)
     pix_enable = bool(pix_cfg.get("enable", False))
 
     occupied: Dict[int, List[Tuple[int, int]]] = {}
@@ -1865,7 +2039,12 @@ def main(argv: List[str]) -> int:
 
     scene = build_timeline(args)
     if not args.no_render:
-        render_animation(scene)
+        render_animation(
+            scene,
+            output_path=str(args.output),
+            fps=int(args.fps),
+            audio_path=str(args.audio or ""),
+        )
     return 0
 
 

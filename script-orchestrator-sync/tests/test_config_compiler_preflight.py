@@ -14,13 +14,14 @@ compiler = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(compiler)
 
 
-def test_preflight_requires_google_application_credentials(monkeypatch) -> None:
-    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-    with pytest.raises(Exception, match=r"GOOGLE_APPLICATION_CREDENTIALS is required"):
-        compiler.ensure_drive_upload_credentials()
+def test_preflight_accepts_google_application_credentials(monkeypatch, tmp_path) -> None:
+    key_path = tmp_path / "drive-sa.json"
+    key_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(key_path))
+    assert compiler.ensure_drive_upload_credentials() == str(key_path)
 
 
-def test_main_missing_creds_does_not_call_upsert(monkeypatch) -> None:
+def test_main_auth_preflight_failure_does_not_call_upsert(monkeypatch) -> None:
     monkeypatch.setenv("CONTROL_SHEET_ID", "sheet_1")
     monkeypatch.setenv("SHEETS_JSON_BASE_URL", "https://example.invalid")
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
@@ -30,7 +31,8 @@ def test_main_missing_creds_does_not_call_upsert(monkeypatch) -> None:
         called["upsert"] += 1
 
     monkeypatch.setattr(compiler, "upsert_render_job", _fake_upsert)
-    with pytest.raises(Exception, match=r"GOOGLE_APPLICATION_CREDENTIALS is required"):
+    monkeypatch.setattr(compiler, "ensure_drive_upload_credentials", lambda: (_ for _ in ()).throw(RuntimeError("auth preflight failed")))
+    with pytest.raises(Exception, match=r"auth preflight failed"):
         compiler.main()
     assert called["upsert"] == 0
 
@@ -65,6 +67,7 @@ def test_build_render_job_upsert_payload_sets_queued_and_clears_lease() -> None:
         lyrics_id="lyrics_id",
         copy_id="",
         preset=preset,
+        bpm="136",
         output_parent_folder_id="out_parent",
         now_iso="2026-03-03T01:00:00+00:00",
     )
@@ -76,3 +79,4 @@ def test_build_render_job_upsert_payload_sets_queued_and_clears_lease() -> None:
     assert row["error_msg"] == ""
     assert row["attempts"] == "0"
     assert row["max_attempts"] == "3"
+    assert row["bpm"] == "136"

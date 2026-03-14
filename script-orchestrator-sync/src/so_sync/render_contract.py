@@ -52,6 +52,7 @@ RENDER_CANONICAL_HEADERS: Mapping[str, List[str]] = {
         "stitch_preset",
         "seed",
         "copy_srt_drive_file_id",
+        "bpm",
     ],
     OUTPUTS_INDEX_TAB: [
         "output_id",

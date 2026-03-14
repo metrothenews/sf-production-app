@@ -494,12 +494,24 @@ def assert_no_overlaps(scene: bpy.types.Scene) -> None:
 # Timeline builder
 # ----------------------------
 
-def pick_clip_from_pool(pool: List[Path], rng: random.Random, *, max_unique_tries: int) -> Path:
+def pick_clip_from_pool(
+    pool: List[Path],
+    rng: random.Random,
+    *,
+    category: str,
+    deck_state: Dict[str, List[int]],
+    max_unique_tries: int,
+) -> Path:
     if not pool:
         raise RuntimeError("Empty pool.")
-    for _ in range(max_unique_tries):
-        return pool[rng.randrange(0, len(pool))]
-    return pool[rng.randrange(0, len(pool))]
+    key = str(category or "").upper() or "_"
+    deck = deck_state.get(key)
+    if not deck:
+        deck = list(range(len(pool)))
+        rng.shuffle(deck)
+        deck_state[key] = deck
+    idx = deck.pop()
+    return pool[idx]
 
 
 def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
@@ -549,6 +561,7 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
     cursor = audio_start
     idx = 0
     remainder = Fraction(0, 1)
+    category_decks: Dict[str, List[int]] = {}
 
     cache_dir = Path(args.cache_dir).expanduser().resolve()
 
@@ -571,7 +584,13 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
         start = cursor
         end_excl = min(audio_end_excl, start + seg_len_i)
 
-        clip_path = pick_clip_from_pool(pools[cat], rng, max_unique_tries=int(args.max_unique_tries))
+        clip_path = pick_clip_from_pool(
+            pools[cat],
+            rng,
+            category=cat,
+            deck_state=category_decks,
+            max_unique_tries=int(args.max_unique_tries),
+        )
         inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
 
         # FIX: loop/tile short clips to fill the entire allotted window (prevents dips to black)

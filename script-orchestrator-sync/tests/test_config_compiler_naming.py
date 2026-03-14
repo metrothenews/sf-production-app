@@ -44,6 +44,14 @@ def test_build_manifest_clips_is_deterministic_and_labeled() -> None:
     assert clips1[1]["label"] == "c002"
 
 
+def test_build_manifest_clips_carries_category_when_present() -> None:
+    files = [
+        {"id": "id_p", "name": "people_a.mp4", "mimeType": "video/mp4", "category": "people"},
+    ]
+    clips = compiler.build_manifest_clips(files, seed=1, max_clips=10)
+    assert clips == [{"drive_file_id": "id_p", "label": "c001", "category": "P"}]
+
+
 def test_collect_files_from_folder_tree_recurses_subfolders() -> None:
     class _Drive:
         def __init__(self) -> None:
@@ -69,6 +77,34 @@ def test_collect_files_from_folder_tree_recurses_subfolders() -> None:
     out = compiler.collect_files_from_folder_tree(_Drive(), "root", max_depth=3)
     ids = [row["id"] for row in out]
     assert ids == ["v1", "v2"]
+
+
+def test_collect_files_from_folder_tree_infers_category_from_top_level_folder() -> None:
+    class _Drive:
+        def __init__(self) -> None:
+            self._rows = {
+                "root": [
+                    {"id": "people_folder", "name": "People", "mimeType": "application/vnd.google-apps.folder"},
+                    {"id": "cars_folder", "name": "Cars", "mimeType": "application/vnd.google-apps.folder"},
+                ],
+                "people_folder": [
+                    {"id": "p1", "name": "person_1.mp4", "mimeType": "video/mp4"},
+                ],
+                "cars_folder": [
+                    {"id": "nested", "name": "nested", "mimeType": "application/vnd.google-apps.folder"},
+                ],
+                "nested": [
+                    {"id": "c1", "name": "car_1.mp4", "mimeType": "video/mp4"},
+                ],
+            }
+
+        def list_files_in_folder(self, folder_id: str):
+            return list(self._rows.get(folder_id, []))
+
+    out = compiler.collect_files_from_folder_tree(_Drive(), "root", max_depth=4)
+    by_id = {row["id"]: row for row in out}
+    assert by_id["p1"]["category"] == "P"
+    assert by_id["c1"]["category"] == "C"
 
 
 def test_enabled_collection_numbers_detects_checked_toggles() -> None:

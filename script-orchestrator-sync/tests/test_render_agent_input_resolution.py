@@ -28,7 +28,7 @@ def test_resolve_pipeline_v1_input_ids_manifest_wins_and_job_is_fallback() -> No
             "audio_drive_file_id": "audio_manifest",
             "lyrics_srt_drive_file_id": "lyrics_manifest",
             "copy_srt_drive_file_id": "copy_manifest",
-            "clips": [{"drive_file_id": "clip1", "label": "c1"}],
+            "clips": [{"drive_file_id": "clip1", "label": "c1", "category": "people"}],
         }
     }
     job = {
@@ -40,7 +40,7 @@ def test_resolve_pipeline_v1_input_ids_manifest_wins_and_job_is_fallback() -> No
     assert resolved["audio_drive_file_id"] == "audio_manifest"
     assert resolved["lyrics_srt_drive_file_id"] == "lyrics_manifest"
     assert resolved["copy_srt_drive_file_id"] == "copy_manifest"
-    assert resolved["clips"] == [{"drive_file_id": "clip1", "label": "c1"}]
+    assert resolved["clips"] == [{"drive_file_id": "clip1", "label": "c1", "category": "P"}]
 
 
 def test_resolve_pipeline_v1_input_ids_uses_job_fallback_when_manifest_missing() -> None:

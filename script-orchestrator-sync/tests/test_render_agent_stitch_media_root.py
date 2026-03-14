@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import pytest
 
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "render_agent.py"
@@ -17,22 +18,49 @@ def test_extract_stitch_categories_from_exec_preset() -> None:
     assert out == ["P", "U", "F", "C", "M", "T"]
 
 
-def test_build_stitcher_media_root_mirrors_clips_into_preset_categories(tmp_path: Path) -> None:
+def test_build_stitcher_media_root_routes_by_clip_category(tmp_path: Path) -> None:
+    clip_p = tmp_path / "inputs" / "people.mp4"
+    clip_u = tmp_path / "inputs" / "urban.mp4"
+    clip_p.parent.mkdir(parents=True, exist_ok=True)
+    clip_p.write_bytes(b"x")
+    clip_u.write_bytes(b"y")
+    root = render_agent._build_stitcher_media_root(
+        [
+            {"path": str(clip_p), "category": "P"},
+            {"path": str(clip_u), "category": "U"},
+        ],
+        str(tmp_path / "media_root"),
+        stitch_preset="2p4u",
+    )
+    media_root = Path(root)
+    assert (media_root / "P" / f"001_{clip_p.name}").exists()
+    assert (media_root / "U" / f"001_{clip_u.name}").exists()
+
+
+def test_build_stitcher_media_root_uses_uncategorized_fallback(tmp_path: Path) -> None:
     clip = tmp_path / "inputs" / "clip1.mp4"
     clip.parent.mkdir(parents=True, exist_ok=True)
     clip.write_bytes(b"x")
     root = render_agent._build_stitcher_media_root(
         [str(clip)],
         str(tmp_path / "media_root"),
-        stitch_preset="2p4u2c",
+        stitch_preset="2p4u",
     )
     media_root = Path(root)
     assert (media_root / "P" / f"001_{clip.name}").exists()
     assert (media_root / "U" / f"001_{clip.name}").exists()
-    assert (media_root / "C" / f"001_{clip.name}").exists()
-    # Legacy fallback buckets are still present.
-    assert (media_root / "A" / f"001_{clip.name}").exists()
-    assert (media_root / "B" / f"001_{clip.name}").exists()
+
+
+def test_build_stitcher_media_root_errors_when_required_category_missing(tmp_path: Path) -> None:
+    clip = tmp_path / "inputs" / "people.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"No clips found for stitch preset category 'U'"):
+        render_agent._build_stitcher_media_root(
+            [{"path": str(clip), "category": "P"}],
+            str(tmp_path / "media_root"),
+            stitch_preset="2p4u",
+        )
 
 
 def test_parse_ffmpeg_timestamp_to_seconds() -> None:

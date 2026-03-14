@@ -27,6 +27,21 @@ CLIPS_LIBRARY_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 OUTPUT_PARENT_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+_CATEGORY_TOKEN_RE = re.compile(r"[a-z]+")
+_CATEGORY_KEYWORDS: Mapping[str, str] = {
+    "people": "P",
+    "person": "P",
+    "cars": "C",
+    "car": "C",
+    "fireworks": "F",
+    "firework": "F",
+    "urban": "U",
+    "city": "U",
+    "money": "M",
+    "cash": "M",
+    "travel": "T",
+    "trip": "T",
+}
 
 EXEC_PRESET_MAP: Mapping[str, Dict[str, Any]] = {
     "exec_preset_1": {
@@ -42,11 +57,18 @@ EXEC_PRESET_MAP: Mapping[str, Dict[str, Any]] = {
 
 def ensure_drive_upload_credentials() -> str:
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if not creds_path:
+    if creds_path:
+        return creds_path
+    try:
+        import google.auth
+
+        google.auth.default(scopes=["https://www.googleapis.com/auth/drive"])
+    except Exception as exc:
         raise DriveUploadError(
-            "GOOGLE_APPLICATION_CREDENTIALS is required for compiler Drive listing/upload. "
-            "Set it to a Drive-enabled service account key JSON path."
-        )
+            "Drive auth preflight failed for compiler Drive listing/upload. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS to a Drive-enabled service account key JSON path, "
+            "or run on attached service account credentials (ADC)."
+        ) from exc
     return creds_path
 
 
@@ -61,6 +83,7 @@ def build_render_job_upsert_payload(
     lyrics_id: str,
     copy_id: str,
     preset: Mapping[str, Any],
+    bpm: str = "",
     output_parent_folder_id: str,
     now_iso: str,
 ) -> Dict[str, Any]:
@@ -80,6 +103,7 @@ def build_render_job_upsert_payload(
             "copy_srt_drive_file_id": copy_id or "",
             "renderer": "pipeline_v1",
             "stitch_preset": preset["stitch_preset"],
+            "bpm": str(bpm or existing.get("bpm") or ""),
             "preset": preset["text_preset"],
             "seed": int(preset["seed"]),
             "fps": int(preset["fps"]),
@@ -126,6 +150,31 @@ def _extract_first_values_matrix(data: Dict[str, Any]) -> list[list[Any]]:
 def normalize_bool(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return text in {"true", "1", "yes", "y"}
+
+
+def resolve_stitch_bpm(cfg: Mapping[str, Any]) -> float:
+    candidates = [
+        "Song BPM",
+        "BPM",
+        "Stitch BPM",
+        "song bpm",
+        "bpm",
+    ]
+    raw = ""
+    for key in candidates:
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            raw = value
+            break
+    if not raw:
+        raw = os.environ.get("PIPELINE_STITCH_BPM", "120").strip() or "120"
+    try:
+        bpm = float(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid BPM value: {raw!r}") from exc
+    if bpm <= 0:
+        raise RuntimeError(f"Invalid BPM value (must be > 0): {raw!r}")
+    return bpm
 
 
 def drive_reference_kind(value: str) -> str:
@@ -245,6 +294,33 @@ def _is_video_like(name: str, mime_type: str) -> bool:
     return lower_name.endswith(".mp4") or lower_name.endswith(".mov")
 
 
+def _normalize_category_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for ch in text:
+        if ch.isalpha():
+            return ch.upper()
+    return ""
+
+
+def _infer_category_from_name(name: str) -> str:
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return ""
+    tokens = _CATEGORY_TOKEN_RE.findall(lowered)
+    if not tokens:
+        return ""
+    for token in tokens:
+        mapped = _CATEGORY_KEYWORDS.get(token)
+        if mapped:
+            return mapped
+    first = tokens[0]
+    if first and first[0].isalpha():
+        return first[0].upper()
+    return ""
+
+
 def build_manifest_clips(
     files: list[dict[str, str]],
     *,
@@ -252,7 +328,12 @@ def build_manifest_clips(
     max_clips: int = 80,
 ) -> list[dict[str, str]]:
     filtered = [
-        {"drive_file_id": str(f.get("id") or "").strip(), "name": str(f.get("name") or ""), "mimeType": str(f.get("mimeType") or "")}
+        {
+            "drive_file_id": str(f.get("id") or "").strip(),
+            "name": str(f.get("name") or ""),
+            "mimeType": str(f.get("mimeType") or ""),
+            "category": _normalize_category_key(f.get("category") or ""),
+        }
         for f in files
         if str(f.get("id") or "").strip() and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
     ]
@@ -260,7 +341,14 @@ def build_manifest_clips(
     rng = random.Random(int(seed))
     rng.shuffle(filtered)
     selected = filtered[: max(0, int(max_clips))]
-    return [{"drive_file_id": row["drive_file_id"], "label": f"c{i:03d}"} for i, row in enumerate(selected, start=1)]
+    out: list[dict[str, str]] = []
+    for i, row in enumerate(selected, start=1):
+        clip_row = {"drive_file_id": row["drive_file_id"], "label": f"c{i:03d}"}
+        cat = str(row.get("category") or "").strip()
+        if cat:
+            clip_row["category"] = cat
+        out.append(clip_row)
+    return out
 
 
 def collect_files_from_folder_tree(
@@ -273,28 +361,32 @@ def collect_files_from_folder_tree(
     if not root:
         return []
     capped_depth = max(0, int(max_depth))
-    queue: list[tuple[str, int]] = [(root, 0)]
+    queue: list[tuple[str, int, str]] = [(root, 0, "")]
     seen_folders: set[str] = {root}
     files: list[dict[str, str]] = []
     while queue:
-        folder_id, depth = queue.pop(0)
+        folder_id, depth, inherited_category = queue.pop(0)
         rows = drive_client.list_files_in_folder(folder_id)
         for row in rows:
             file_id = str(row.get("id") or "").strip()
             mime = str(row.get("mimeType") or "").strip()
+            name = str(row.get("name") or "")
             if not file_id:
                 continue
             if mime == DRIVE_FOLDER_MIME and depth < capped_depth:
+                child_category = _normalize_category_key(inherited_category) or _infer_category_from_name(name)
                 if file_id not in seen_folders:
                     seen_folders.add(file_id)
-                    queue.append((file_id, depth + 1))
+                    queue.append((file_id, depth + 1, child_category))
                 continue
+            inferred_category = _normalize_category_key(inherited_category) or _infer_category_from_name(name)
             files.append(
                 {
                     "id": file_id,
-                    "name": str(row.get("name") or ""),
+                    "name": name,
                     "mimeType": mime,
                     "size": str(row.get("size") or ""),
+                    "category": inferred_category,
                 }
             )
     return files
@@ -615,6 +707,7 @@ def main() -> int:
         assets_folder_id=assets_folder_id,
         clips_library_folder_id=clips_library_folder_id,
     )
+    stitch_bpm = resolve_stitch_bpm(cfg)
 
     base_cuts = build_cuts_from_config(cfg, naming_convention=naming_convention, start_index=0)
     drive_client = drive_upload_from_env()
@@ -674,7 +767,7 @@ def main() -> int:
             effective_preset["stitch_preset"] = str(preset_row["stitch_preset"]).strip()
         if str(preset_row.get("text_preset") or "").strip():
             effective_preset["text_preset"] = str(preset_row["text_preset"]).strip()
-        # Stochastic per-run seed to avoid deterministic duplicate outputs.
+        # Stochastic per-run seed remains the fallback/default for job-level fields.
         run_seed = int(rng.randrange(1, 2_147_483_647))
         effective_preset["seed"] = run_seed
         run_cuts = build_cuts_from_config(
@@ -694,6 +787,38 @@ def main() -> int:
             seed=run_seed,
             max_clips=80,
         )
+        run_cuts_with_exec: list[dict[str, Any]] = []
+        for cut_idx, cut in enumerate(run_cuts):
+            output_idx = (i * clip_count) + cut_idx
+            cut_preset_row = dynamic_preset_rows[output_idx % len(dynamic_preset_rows)]
+            cut_preset = dict(preset)
+            if str(cut_preset_row.get("stitch_preset") or "").strip():
+                cut_preset["stitch_preset"] = str(cut_preset_row["stitch_preset"]).strip()
+            if str(cut_preset_row.get("text_preset") or "").strip():
+                cut_preset["text_preset"] = str(cut_preset_row["text_preset"]).strip()
+            # Per-cut seed ensures deterministic behavior per short while avoiding duplicates.
+            cut_preset_seed = int(rng.randrange(1, 2_147_483_647))
+            cut_preset["seed"] = cut_preset_seed
+            cut_row = dict(cut)
+            cut_row.update(
+                {
+                    "stitch_preset": str(cut_preset["stitch_preset"]),
+                    "text_preset": str(cut_preset["text_preset"]),
+                    "seed": int(cut_preset["seed"]),
+                    "fps": int(cut_preset["fps"]),
+                    "aspect": str(cut_preset["aspect"]),
+                    "bg_mode": str(cut_preset["bg_mode"]),
+                }
+            )
+            run_cuts_with_exec.append(cut_row)
+        if run_cuts_with_exec:
+            first_cut = run_cuts_with_exec[0]
+            effective_preset["stitch_preset"] = str(first_cut.get("stitch_preset") or effective_preset["stitch_preset"])
+            effective_preset["text_preset"] = str(first_cut.get("text_preset") or effective_preset["text_preset"])
+            try:
+                effective_preset["seed"] = int(first_cut.get("seed") or effective_preset["seed"])
+            except Exception:
+                pass
 
         manifest: Dict[str, Any] = {
             "schema_version": "pipeline_v1@1",
@@ -707,6 +832,7 @@ def main() -> int:
             },
             "stitch": {
                 "preset": effective_preset["stitch_preset"],
+                "bpm": stitch_bpm,
                 "seed": int(effective_preset["seed"]),
                 "fps": int(effective_preset["fps"]),
                 "aspect": str(effective_preset["aspect"]),
@@ -717,7 +843,7 @@ def main() -> int:
                 "fps": int(effective_preset["fps"]),
                 "aspect": str(effective_preset["aspect"]),
             },
-            "cuts": run_cuts,
+            "cuts": run_cuts_with_exec,
         }
         manifest_drive_file_id = _upload_manifest(
             manifest,
@@ -739,6 +865,7 @@ def main() -> int:
             lyrics_id=lyrics_id,
             copy_id=copy_id,
             preset=effective_preset,
+            bpm=f"{stitch_bpm:g}",
             output_parent_folder_id=output_parent_folder_id,
             now_iso=now_iso,
         )
@@ -748,6 +875,7 @@ def main() -> int:
             f"queued_render_job_id={render_job_id} "
             f"manifest_drive_file_id={manifest_drive_file_id} "
             f"stitch_preset={effective_preset['stitch_preset']} "
+            f"bpm={stitch_bpm:g} "
             f"text_preset={effective_preset['text_preset']} "
             f"seed={effective_preset['seed']} "
             f"collection={run_collection_num} "
@@ -759,6 +887,7 @@ def main() -> int:
     print(f"number_of_videos={number_of_videos}")
     print(f"cuts_generated={len(base_cuts)}")
     print(f"audio_drive_file_id={audio_id}")
+    print(f"stitch_bpm={stitch_bpm:g}")
     print(f"lyrics_srt_drive_file_id={lyrics_id}")
     print(f"copy_srt_drive_file_id={copy_id or ''}")
     print(f"queued_jobs={json.dumps(queued_job_ids)}")
