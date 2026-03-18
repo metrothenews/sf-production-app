@@ -236,81 +236,83 @@ curl -fsS http://<VM_EXTERNAL_IP>:8000/healthz
 
 ## Cloud Render Update Workflow (Current Production Path)
 
-Use this flow for code changes that affect cloud rendering.
+Use this flow for production cloud rendering updates.
 
-Current production control plane:
-- Cloud Run service: `so-control-api`
+Current production components:
+- Control plane: Cloud Run service `so-control-api`
+- Render workers: ephemeral Cloud Batch VMs (created per job, then terminated)
 - Region: `us-east1` (South Carolina)
-- Batch region: `us-east1`
 - Artifact Registry repo: `us-east1-docker.pkg.dev/drive-cdn-proxy/so-images`
 
-### 1) Make code changes and run local checks
+### If someone asks about "the VM"
 
-```bash
-cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
-PYTHONPATH=src .venv/bin/python3 -m pytest -q tests/test_batch_trigger.py
-```
+Use this exact clarification:
+- "Production render does not use one persistent VM. It uses Cloud Batch, which spins up short-lived worker VMs per render job and tears them down after completion. Cloud Run (`so-control-api`) submits and tracks those jobs."
 
-Run additional targeted tests for files you changed.
-
-### 2) Commit and push to GitHub
-
-```bash
-cd /Users/samrooker/Desktop/sf-production-app
-git checkout -b codex/<short-change-name>
-git add <changed-files>
-git commit -m "<clear message>"
-git push -u origin codex/<short-change-name>
-```
-
-### 3) Build and push a new container image (Cloud Build)
-
-Use Cloud Build (works even when local Docker daemon is unavailable):
-
-```bash
-cat > /tmp/cloudbuild-script-orchestrator-sync.yaml <<'YAML'
-steps:
-  - name: gcr.io/cloud-builders/docker
-    args:
-      - build
-      - -t
-      - ${_IMAGE}
-      - -f
-      - script-orchestrator-sync/Dockerfile
-      - .
-images:
-  - ${_IMAGE}
-YAML
-
-TS=$(date +%Y%m%d-%H%M%S)
-IMAGE="us-east1-docker.pkg.dev/drive-cdn-proxy/so-images/script-orchestrator-sync:${TS}"
-gcloud builds submit /Users/samrooker/Desktop/sf-production-app \
-  --config /tmp/cloudbuild-script-orchestrator-sync.yaml \
-  --substitutions _IMAGE=${IMAGE} \
-  --project drive-cdn-proxy
-```
-
-### 4) Deploy new image to Cloud Run
-
-This keeps Batch aligned to the same image:
-
-```bash
-gcloud run services update so-control-api \
-  --region us-east1 \
-  --image "${IMAGE}" \
-  --update-env-vars "^##^BATCH_IMAGE_URI=${IMAGE}##BATCH_SERVICE_ACCOUNT_SCOPES=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive" \
-  --set-secrets DRIVE_SA_KEY_JSON=so-drive-sa-key-json:latest
-```
-
-Verify active revision/image:
+How to verify that quickly:
 
 ```bash
 gcloud run services describe so-control-api \
   --region us-east1 \
-  --format='value(status.latestReadyRevisionName,spec.template.spec.containers[0].image,status.url)'
+  --project drive-cdn-proxy \
+  --format='value(spec.template.spec.containers[0].env,status.url)'
 ```
 
-### 5) Trigger and test a real cloud render batch
+Look for:
+- `RENDER_EXEC_BACKEND=batch`
+- `BATCH_IMAGE_URI=<artifact-registry-image>`
+
+Note:
+- The "VM batch-worker" compose setup in this README is a separate self-hosted deployment option.
+- It is not the same as current Cloud Run + Cloud Batch production.
+
+### Exact rollout + verification sequence (the one used in production on March 18, 2026)
+
+1) Confirm auth + project:
+
+```bash
+gcloud auth list
+gcloud config get-value project
+```
+
+Expected project: `drive-cdn-proxy`.
+
+2) Build and push a new worker image using the checked-in Cloud Build config:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app
+TS=$(date +%Y%m%d-%H%M%S)
+IMAGE="us-east1-docker.pkg.dev/drive-cdn-proxy/so-images/script-orchestrator-sync:${TS}"
+gcloud builds submit . \
+  --config script-orchestrator-sync/cloudbuild.batch-image.yaml \
+  --substitutions _IMAGE_URI="${IMAGE}" \
+  --project drive-cdn-proxy
+echo "${IMAGE}"
+```
+
+3) Update Cloud Run env so new Batch jobs use the new worker image:
+
+```bash
+gcloud run services update so-control-api \
+  --region us-east1 \
+  --project drive-cdn-proxy \
+  --update-env-vars "BATCH_IMAGE_URI=${IMAGE}"
+```
+
+4) Verify Cloud Run revision/env after update:
+
+```bash
+gcloud run services describe so-control-api \
+  --region us-east1 \
+  --project drive-cdn-proxy \
+  --format='value(status.latestReadyRevisionName,spec.template.spec.containers[0].image,spec.template.spec.containers[0].env)'
+```
+
+Important:
+- For worker-only rollout, Cloud Run container image may stay on an older tag.
+- That is expected as long as `BATCH_IMAGE_URI` is updated to the new tag.
+
+5) Trigger a real render batch:
 
 ```bash
 TOKEN=$(gcloud auth print-identity-token)
@@ -320,43 +322,88 @@ curl -sS -X POST "https://YOUR-CONTROL-API.a.run.app/api/v1/render/run-batch" \
   -d '{"poll_seconds":1.0,"max_rounds":40}'
 ```
 
-Watch Batch job state:
+Capture `batch_job_name` from the response (example: `projects/drive-cdn-proxy/locations/us-east1/jobs/render-...`).
+
+6) Confirm the spawned Batch job is using the expected image tag:
 
 ```bash
-gcloud batch jobs describe <JOB_ID> \
-  --location=us-east1 \
+JOB_ID="<render-job-id-from-response>"
+gcloud batch jobs describe "${JOB_ID}" \
+  --location us-east1 \
+  --project drive-cdn-proxy \
+  --format='value(status.state,taskGroups[0].taskSpec.runnables[0].container.imageUri)'
+```
+
+7) Monitor until terminal state:
+
+```bash
+gcloud batch jobs describe "${JOB_ID}" \
+  --location us-east1 \
+  --project drive-cdn-proxy \
   --format='value(status.state,status.runDuration,status.statusEvents[-1].description)'
 ```
 
-Pull task logs:
+8) Pull run logs:
 
 ```bash
 gcloud logging read \
-  "logName=\"projects/drive-cdn-proxy/logs/batch_task_logs\" AND labels.task_group_name:\"<JOB_ID>\"" \
-  --limit=120 \
+  "logName=\"projects/drive-cdn-proxy/logs/batch_task_logs\" AND labels.task_group_name:\"${JOB_ID}\"" \
+  --project drive-cdn-proxy \
+  --limit=200 \
   --order=desc \
   --format='value(timestamp,severity,textPayload)'
 ```
 
-API status check:
+9) Confirm API-side final status:
 
 ```bash
 TOKEN=$(gcloud auth print-identity-token)
-curl -sS "https://YOUR-CONTROL-API.a.run.app/api/v1/render/batch-jobs/<JOB_ID>" \
+curl -sS "https://YOUR-CONTROL-API.a.run.app/api/v1/render/batch-jobs/${JOB_ID}" \
   -H "Authorization: Bearer ${TOKEN}"
 ```
 
-### 6) Roll back quickly if needed
+Expected healthy result:
+- `status: success`
+- `batch_state: succeeded`
+- task logs show `Render run success: ...`
+
+### Full control-plane + worker rollout (only when API code changed)
+
+If `so-control-api` code changed too, update both Cloud Run image and worker image:
 
 ```bash
-gcloud run revisions list --service so-control-api --region us-east1
 gcloud run services update so-control-api \
   --region us-east1 \
-  --image <PREVIOUS_IMAGE_URI> \
-  --update-env-vars BATCH_IMAGE_URI=<PREVIOUS_IMAGE_URI>
+  --project drive-cdn-proxy \
+  --image "${IMAGE}" \
+  --update-env-vars "^##^BATCH_IMAGE_URI=${IMAGE}##BATCH_SERVICE_ACCOUNT_SCOPES=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive" \
+  --set-secrets DRIVE_SA_KEY_JSON=so-drive-sa-key-json:latest
 ```
 
-### 7) Cost safety defaults to keep
+### Rollback (fast)
+
+Rollback worker image only:
+
+```bash
+PREV_IMAGE="<previous-good-image-uri>"
+gcloud run services update so-control-api \
+  --region us-east1 \
+  --project drive-cdn-proxy \
+  --update-env-vars "BATCH_IMAGE_URI=${PREV_IMAGE}"
+```
+
+Rollback both API image and worker image:
+
+```bash
+PREV_IMAGE="<previous-good-image-uri>"
+gcloud run services update so-control-api \
+  --region us-east1 \
+  --project drive-cdn-proxy \
+  --image "${PREV_IMAGE}" \
+  --update-env-vars "BATCH_IMAGE_URI=${PREV_IMAGE}"
+```
+
+### Cost safety defaults to keep
 
 - Keep `BATCH_JOB_QUEUE=render-default` and serial trigger behavior (`409 busy` when active).
 - Keep Cloud Run `min-instances=0`, `max-instances=1`, `concurrency=1`.
