@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from so_sync.drive_proxy import DriveProxyError, from_env as drive_proxy_from_env  # noqa: E402
 from so_sync.drive_upload import DriveUploadError, from_env as drive_upload_from_env  # noqa: E402
+from so_sync.gcs_storage import GcsStorageClient, GcsStorageError, parse_gs_uri  # noqa: E402
 from so_sync.gateway import SheetsGateway  # noqa: E402
 from so_sync.repositories import normalize_enabled_value  # noqa: E402
 from so_sync.render_contract import (  # noqa: E402
@@ -355,8 +356,11 @@ def resolve_pipeline_v1_input_ids(manifest: dict[str, Any], job: dict[str, Any])
             if not isinstance(raw, dict):
                 continue
             drive_id = str(raw.get("drive_file_id") or "").strip()
-            if not drive_id:
+            gcs_uri = str(raw.get("gcs_uri") or "").strip()
+            if not drive_id and not gcs_uri:
                 continue
+            if not drive_id and gcs_uri:
+                drive_id = f"gcs_{hashlib.sha1(gcs_uri.encode('utf-8')).hexdigest()[:16]}"
             label = str(raw.get("label") or f"clip_{i:03d}").strip()
             clip_row = {"drive_file_id": drive_id, "label": label}
             category = _normalize_category_key(raw.get("category") or raw.get("cat") or "")
@@ -365,6 +369,11 @@ def resolve_pipeline_v1_input_ids(manifest: dict[str, Any], job: dict[str, Any])
             collection_num = _normalize_collection_num(raw.get("collection_num"))
             if collection_num:
                 clip_row["collection_num"] = collection_num
+            if gcs_uri:
+                clip_row["gcs_uri"] = gcs_uri
+            gcs_object = str(raw.get("gcs_object") or "").strip()
+            if gcs_object:
+                clip_row["gcs_object"] = gcs_object
             clips.append(clip_row)
     audio_id = str(inputs.get("audio_drive_file_id") or job.get("audio_drive_file_id") or "").strip()
     lyrics_id = str(inputs.get("lyrics_srt_drive_file_id") or job.get("srt_drive_file_id") or "").strip()
@@ -1896,19 +1905,41 @@ def _download_with_fallback(
             print(f"drive_download_fallback=drive_api file_id={drive_file_id} reason={reason}")
             uploader = upload_client or drive_upload_from_env()
             try:
+                print(f"clip_download_source=drive file_id={drive_file_id} via=drive_api reason={reason}")
                 return uploader.download_file(drive_file_id, dst_path)
             except DriveUploadError as up_exc:
                 raise RuntimeError(str(up_exc)) from up_exc
     try:
+        print(f"clip_download_source=drive file_id={drive_file_id} via=proxy")
         return proxy.download_file(drive_file_id, dst_path)
     except DriveProxyError as exc:
         reason = _proxy_error_reason(exc)
         print(f"drive_download_fallback=drive_api file_id={drive_file_id} reason={reason}")
         uploader = upload_client or drive_upload_from_env()
         try:
+            print(f"clip_download_source=drive file_id={drive_file_id} via=drive_api reason={reason}")
             return uploader.download_file(drive_file_id, dst_path)
         except DriveUploadError as up_exc:
             raise RuntimeError(str(up_exc)) from up_exc
+
+
+_GCS_CLIENT_CACHE: dict[str, GcsStorageClient] = {}
+
+
+def _download_gcs_uri(gcs_uri: str, dst_path: str) -> str:
+    bucket, obj = parse_gs_uri(gcs_uri)
+    client = _GCS_CLIENT_CACHE.get(bucket)
+    if client is None:
+        try:
+            client = GcsStorageClient.from_adc(bucket)
+        except GcsStorageError as exc:
+            raise RuntimeError(str(exc)) from exc
+        _GCS_CLIENT_CACHE[bucket] = client
+    try:
+        print(f"clip_download_source=gcs bucket={bucket} object={obj}")
+        return client.download_to_path(obj, dst_path)
+    except GcsStorageError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -1963,19 +1994,35 @@ def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) ->
     clip_specs = list(resolved_ids.get("clips") or [])
     for clip in clip_specs:
         drive_id = str(clip.get("drive_file_id") or "").strip()
+        gcs_uri = str(clip.get("gcs_uri") or "").strip()
         label = str(clip.get("label") or drive_id).strip()
         category = _normalize_category_key(clip.get("category") or "")
         collection_num = _normalize_collection_num(clip.get("collection_num"))
-        if not drive_id:
+        if not drive_id and not gcs_uri:
             continue
-        clip_path = str(Path(paths["clips"]) / build_clip_filename(label, drive_id))
-        _download_with_fallback(drive_id, clip_path)
+        ext = ".mp4"
+        if gcs_uri:
+            try:
+                _, obj = parse_gs_uri(gcs_uri)
+                ext = Path(obj).suffix or ".mp4"
+            except Exception:
+                ext = ".mp4"
+        clip_path = str(Path(paths["clips"]) / build_clip_filename(label, drive_id or "clip", ext=ext))
+        if gcs_uri:
+            _download_gcs_uri(gcs_uri, clip_path)
+        else:
+            _download_with_fallback(drive_id, clip_path)
         clip_paths.append(clip_path)
         clip_spec_row = {"path": clip_path, "drive_file_id": drive_id, "label": label}
         if category:
             clip_spec_row["category"] = category
         if collection_num:
             clip_spec_row["collection_num"] = collection_num
+        if gcs_uri:
+            clip_spec_row["gcs_uri"] = gcs_uri
+        gcs_object = str(clip.get("gcs_object") or "").strip()
+        if gcs_object:
+            clip_spec_row["gcs_object"] = gcs_object
         clip_specs_out.append(clip_spec_row)
 
     return {

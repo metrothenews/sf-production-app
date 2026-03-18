@@ -410,6 +410,76 @@ gcloud run services update so-control-api \
 - Keep Batch retries low (`BATCH_MAX_RETRIES=1`) until stable.
 - Keep billing budget alerts and Batch failure alerts enabled.
 
+## Clip Library Mirror (Drive -> GCS)
+
+Goal:
+- Keep clip-library curation in Google Drive.
+- Avoid repeated Drive download costs during renders by mirroring clips into GCS.
+- Render pipeline reads clips from GCS mirror (`gcs_mirror` mode) instead of pulling clip media from Drive each run.
+
+Mirror refresh command:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+export CLIPS_LIBRARY_FOLDER_ID=YOUR_GOOGLE_SHEET_ID
+export CLIPS_LIBRARY_MIRROR_BUCKET=<your-bucket>
+export CLIPS_LIBRARY_MIRROR_PREFIX=library-mirror
+make library-mirror-refresh
+```
+
+Dry run:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+export CLIPS_LIBRARY_FOLDER_ID=YOUR_GOOGLE_SHEET_ID
+export CLIPS_LIBRARY_MIRROR_BUCKET=<your-bucket>
+make library-mirror-refresh-dry
+```
+
+What `library_mirror_refresh` does:
+- scans direct Drive subfolders matching `collection-<number>` only
+- recursively indexes video files and inferred category (`P/C/F/T/U/M`)
+- uploads new/mismatched clips to `gs://<bucket>/<prefix>/clips/...`
+- moves stale active clips to quarantine (`gs://<bucket>/<prefix>/quarantine/<timestamp>/...`)
+- purges quarantined clips after `CLIPS_LIBRARY_MIRROR_QUARANTINE_TTL_DAYS` (default `7`)
+- writes mirror index JSON at:
+  `gs://<bucket>/<prefix>/indexes/library_mirror_index.json`
+- tracks quarantine state at:
+  `gs://<bucket>/<prefix>/indexes/quarantine_manifest.json`
+
+Switch render compile to GCS mirror source:
+
+```bash
+export CLIPS_LIBRARY_SOURCE=gcs_mirror
+export CLIPS_LIBRARY_MIRROR_BUCKET=<your-bucket>
+export CLIPS_LIBRARY_MIRROR_PREFIX=library-mirror
+export CLIPS_LIBRARY_MIRROR_INDEX_OBJECT=library-mirror/indexes/library_mirror_index.json
+export CLIPS_LIBRARY_MIRROR_WARN_STALE_HOURS=24
+```
+
+Compile + run with mirror source:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+make run-batch-preflight
+make run-batch
+```
+
+In `gcs_mirror` mode:
+- `compile_config_to_render_job.py` reads clip inventory from mirror index JSON.
+- compile logs mirror freshness (`generated_utc`, age hours) and warns if stale.
+- compile validates category coverage for selected collections/cut presets before queueing jobs.
+- manifest clip rows carry `gcs_uri`/`gcs_object`.
+- `render_agent.py` downloads clip media from GCS for those clip rows.
+- missing GCS clip/object fails the run immediately (no Drive fallback for clip media).
+- audio/lyrics/copy assets still use Drive IDs (unchanged).
+
+Rollback:
+
+```bash
+export CLIPS_LIBRARY_SOURCE=drive
+```
+
 ## Happy Path Entrypoints
 
 - FastAPI: `src/so_sync/api.py`

@@ -62,6 +62,27 @@ def test_build_manifest_clips_carries_collection_num_when_present() -> None:
     assert clips == [{"drive_file_id": "id_1", "label": "c001", "collection_num": "8"}]
 
 
+def test_build_manifest_clips_carries_gcs_fields_when_present() -> None:
+    files = [
+        {
+            "id": "id_1",
+            "name": "clip_a.mp4",
+            "mimeType": "video/mp4",
+            "gcs_uri": "gs://bucket/library-mirror/clips/collection-1/P/id_1__clip_a.mp4",
+            "gcs_object": "library-mirror/clips/collection-1/P/id_1__clip_a.mp4",
+        },
+    ]
+    clips = compiler.build_manifest_clips(files, seed=1, max_clips=10)
+    assert clips == [
+        {
+            "drive_file_id": "id_1",
+            "label": "c001",
+            "gcs_uri": "gs://bucket/library-mirror/clips/collection-1/P/id_1__clip_a.mp4",
+            "gcs_object": "library-mirror/clips/collection-1/P/id_1__clip_a.mp4",
+        }
+    ]
+
+
 def test_collect_files_from_folder_tree_recurses_subfolders() -> None:
     class _Drive:
         def __init__(self) -> None:

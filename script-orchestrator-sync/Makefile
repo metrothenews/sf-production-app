@@ -7,7 +7,7 @@ COMPOSE ?= docker compose
 COMPOSE_PROD := $(COMPOSE) -f docker-compose.prod.yml
 COMPOSE_VM_BATCH := $(COMPOSE) -f docker-compose.prod.yml -f docker-compose.vm-batch.yml
 
-.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch run-batch-preflight docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod docker-build-vm-batch docker-up-vm-batch docker-down-vm-batch docker-logs-vm-batch deploy-vm deploy-vm-batch vm-bootstrap
+.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch run-batch-preflight library-mirror-refresh library-mirror-refresh-dry docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod docker-build-vm-batch docker-up-vm-batch docker-down-vm-batch docker-logs-vm-batch deploy-vm deploy-vm-batch vm-bootstrap
 
 venv:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -115,6 +115,20 @@ run-batch-preflight:
 	export SHEETS_JSON_BASE_URL="$${SHEETS_JSON_BASE_URL:-$(BASE_URL_DEFAULT)}"; \
 	export PYTHONPATH=src; \
 	.venv_local/bin/python scripts/trigger_render_batch.py --preflight-only
+
+library-mirror-refresh:
+	@set -euo pipefail; \
+	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
+	export CLIPS_LIBRARY_MIRROR_PREFIX="$${CLIPS_LIBRARY_MIRROR_PREFIX:-library-mirror}"; \
+	export PYTHONPATH=src; \
+	.venv_local/bin/python scripts/library_mirror_refresh.py
+
+library-mirror-refresh-dry:
+	@set -euo pipefail; \
+	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
+	export CLIPS_LIBRARY_MIRROR_PREFIX="$${CLIPS_LIBRARY_MIRROR_PREFIX:-library-mirror}"; \
+	export PYTHONPATH=src; \
+	.venv_local/bin/python scripts/library_mirror_refresh.py --dry-run
 
 docker-build:
 	@$(COMPOSE) build app

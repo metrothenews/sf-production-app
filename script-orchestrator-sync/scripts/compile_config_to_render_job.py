@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from so_sync.drive_upload import DriveUploadError, from_env as drive_upload_from_env  # noqa: E402
 from so_sync.gateway import SheetsGateway  # noqa: E402
+from so_sync.gcs_storage import GcsStorageError, GcsStorageClient  # noqa: E402
 from so_sync.render_repo import find_render_job_by_id, upsert_render_job  # noqa: E402
 
 CONFIG_SHEET_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
@@ -363,6 +364,8 @@ def build_manifest_clips(
             "mimeType": str(f.get("mimeType") or ""),
             "category": _normalize_category_key(f.get("category") or ""),
             "collection_num": str(f.get("collection_num") or "").strip(),
+            "gcs_uri": str(f.get("gcs_uri") or "").strip(),
+            "gcs_object": str(f.get("gcs_object") or "").strip(),
         }
         for f in files
         if str(f.get("id") or "").strip() and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
@@ -380,6 +383,12 @@ def build_manifest_clips(
         collection_num = str(row.get("collection_num") or "").strip()
         if collection_num:
             clip_row["collection_num"] = collection_num
+        gcs_uri = str(row.get("gcs_uri") or "").strip()
+        gcs_object = str(row.get("gcs_object") or "").strip()
+        if gcs_uri:
+            clip_row["gcs_uri"] = gcs_uri
+        if gcs_object:
+            clip_row["gcs_object"] = gcs_object
         out.append(clip_row)
     return out
 
@@ -480,6 +489,144 @@ def resolve_collection_folder_ids(
         )
     resolved: list[dict[str, str]] = [{"collection_num": str(num), "folder_id": fid} for num, fid in found]
     return resolved
+
+
+def _clips_source_mode() -> str:
+    explicit = str(os.environ.get("CLIPS_LIBRARY_SOURCE", "")).strip().lower()
+    if explicit in {"drive", "gcs_mirror"}:
+        return explicit
+    return "drive"
+
+
+def _clips_mirror_index_object(prefix: str) -> str:
+    explicit = str(os.environ.get("CLIPS_LIBRARY_MIRROR_INDEX_OBJECT", "")).strip()
+    if explicit:
+        return explicit
+    pre = str(prefix or "").strip().strip("/")
+    if not pre:
+        pre = "library-mirror"
+    return f"{pre}/indexes/library_mirror_index.json"
+
+
+def _mirror_warn_stale_hours() -> float:
+    raw = str(os.environ.get("CLIPS_LIBRARY_MIRROR_WARN_STALE_HOURS", "24")).strip()
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 24.0
+
+
+def _extract_stitch_categories(stitch_preset: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    s = str(stitch_preset or "").strip()
+    i = 0
+    while i < len(s):
+        if not s[i].isdigit():
+            i += 1
+            continue
+        j = i
+        while j < len(s) and s[j].isdigit():
+            j += 1
+        k = j
+        while k < len(s) and s[k].isalpha():
+            k += 1
+        if k == j:
+            i = j + 1
+            continue
+        suffix = s[j:k]
+        cat = suffix[-1].upper()
+        if cat and cat.isalpha() and cat not in seen:
+            seen.add(cat)
+            out.append(cat)
+        i = k
+    return out
+
+
+def _collection_category_counts(files: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {}
+    for row in files:
+        collection_num = str(row.get("collection_num") or "").strip()
+        if not collection_num:
+            continue
+        cat = _normalize_category_key(row.get("category") or "")
+        if not cat:
+            continue
+        bucket = out.setdefault(collection_num, {})
+        bucket[cat] = int(bucket.get(cat, 0)) + 1
+    return out
+
+
+def _load_collection_pools_from_gcs_mirror(
+    *,
+    bucket: str,
+    prefix: str,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    bucket_name = str(bucket or "").strip()
+    if not bucket_name:
+        raise RuntimeError("CLIPS_LIBRARY_MIRROR_BUCKET is required when CLIPS_LIBRARY_SOURCE=gcs_mirror")
+    mirror_prefix = str(prefix or "").strip().strip("/") or "library-mirror"
+    index_object = _clips_mirror_index_object(mirror_prefix)
+    try:
+        gcs = GcsStorageClient.from_adc(bucket_name)
+        raw = gcs.download_text(index_object)
+    except GcsStorageError as exc:
+        raise RuntimeError(f"Failed to load mirror index from bucket={bucket_name} object={index_object}: {exc}") from exc
+
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Mirror index is not valid JSON: gs://{bucket_name}/{index_object}") from exc
+
+    clips_raw = payload.get("clips") if isinstance(payload, dict) else None
+    if not isinstance(clips_raw, list) or not clips_raw:
+        raise RuntimeError(f"Mirror index has no clips: gs://{bucket_name}/{index_object}")
+
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for item in clips_raw:
+        if not isinstance(item, dict):
+            continue
+        drive_file_id = str(item.get("drive_file_id") or item.get("id") or "").strip()
+        collection_num = str(item.get("collection_num") or "").strip()
+        if not drive_file_id or not collection_num:
+            continue
+        row = {
+            "id": drive_file_id,
+            "name": str(item.get("name") or ""),
+            "mimeType": str(item.get("mimeType") or "video/mp4"),
+            "size": str(item.get("size") or ""),
+            "category": _normalize_category_key(item.get("category") or ""),
+            "collection_num": collection_num,
+            "gcs_uri": str(item.get("gcs_uri") or ""),
+            "gcs_object": str(item.get("gcs_object") or ""),
+        }
+        grouped.setdefault(collection_num, []).append(row)
+
+    pools: list[dict[str, Any]] = []
+    for collection_num in sorted(grouped.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
+        files = grouped[collection_num]
+        video_files = [f for f in files if _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))]
+        if not video_files:
+            continue
+        pools.append(
+            {
+                "collection_num": collection_num,
+                "folder_id": "",
+                "files": files,
+            }
+        )
+    if not pools:
+        raise RuntimeError(f"Mirror index has no usable collection pools: gs://{bucket_name}/{index_object}")
+    total_clips_raw = payload.get("total_clips") if isinstance(payload, dict) else 0
+    try:
+        total_clips = int(total_clips_raw or 0)
+    except Exception:
+        total_clips = 0
+    meta = {
+        "generated_utc": str(payload.get("generated_utc") or "").strip() if isinstance(payload, dict) else "",
+        "total_clips": total_clips,
+    }
+    return pools, index_object, meta
 
 
 def resolve_drive_file_id(value: str, *, label: str, assets_folder_id: str, clips_library_folder_id: str) -> str:
@@ -748,42 +895,99 @@ def main() -> int:
 
     base_cuts = build_cuts_from_config(cfg, naming_convention=naming_convention, start_index=0)
     drive_client = drive_upload_from_env()
+    clips_source_mode = _clips_source_mode()
+    mirror_bucket = str(os.environ.get("CLIPS_LIBRARY_MIRROR_BUCKET", "")).strip()
+    mirror_prefix = str(os.environ.get("CLIPS_LIBRARY_MIRROR_PREFIX", "library-mirror")).strip().strip("/") or "library-mirror"
     try:
         clips_tree_depth = int(str(os.environ.get("CLIPS_LIBRARY_MAX_DEPTH", "4")).strip())
     except Exception:
         clips_tree_depth = 4
-    collection_folders = resolve_collection_folder_ids(
-        cfg,
-        drive_client=drive_client,
-        root_folder_id=clips_library_folder_id,
-    )
-    if not collection_folders:
-        raise RuntimeError("No collection folders found. Add direct subfolders named `collection-<number>`.")
     collection_pools: list[dict[str, Any]] = []
-    for row in collection_folders:
-        folder_id = str(row.get("folder_id") or "").strip()
-        collection_num = str(row.get("collection_num") or "")
-        files = collect_files_from_folder_tree(
-            drive_client,
-            folder_id,
-            max_depth=clips_tree_depth,
+    mirror_index_object = ""
+    mirror_meta: dict[str, Any] = {}
+    if clips_source_mode == "gcs_mirror":
+        collection_pools, mirror_index_object, mirror_meta = _load_collection_pools_from_gcs_mirror(
+            bucket=mirror_bucket,
+            prefix=mirror_prefix,
         )
-        video_files = [
-            f
-            for f in files
-            if str(f.get("id") or "").strip() and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
-        ]
-        if not video_files:
-            raise RuntimeError(
-                f"collection-{collection_num} resolved to folder {folder_id}, but no video clips were found."
+    else:
+        collection_folders = resolve_collection_folder_ids(
+            cfg,
+            drive_client=drive_client,
+            root_folder_id=clips_library_folder_id,
+        )
+        if not collection_folders:
+            raise RuntimeError("No collection folders found. Add direct subfolders named `collection-<number>`.")
+        for row in collection_folders:
+            folder_id = str(row.get("folder_id") or "").strip()
+            collection_num = str(row.get("collection_num") or "")
+            files = collect_files_from_folder_tree(
+                drive_client,
+                folder_id,
+                max_depth=clips_tree_depth,
             )
-        collection_pools.append(
-            {
-                "collection_num": collection_num,
-                "folder_id": folder_id,
-                "files": files,
-            }
+            video_files = [
+                f
+                for f in files
+                if str(f.get("id") or "").strip() and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
+            ]
+            if not video_files:
+                raise RuntimeError(
+                    f"collection-{collection_num} resolved to folder {folder_id}, but no video clips were found."
+                )
+            collection_pools.append(
+                {
+                    "collection_num": collection_num,
+                    "folder_id": folder_id,
+                    "files": files,
+                }
+            )
+    print(
+        f"clips_source_mode={clips_source_mode} "
+        f"mirror_bucket={mirror_bucket or '(unset)'} "
+        f"mirror_prefix={mirror_prefix or '(unset)'} "
+        f"mirror_index_object={mirror_index_object or '(none)'}"
+    )
+    if clips_source_mode == "gcs_mirror":
+        generated_utc = str(mirror_meta.get("generated_utc") or "").strip()
+        index_total_clips = int(mirror_meta.get("total_clips") or 0)
+        mirror_pool_counts = {
+            str(pool.get("collection_num") or ""): len(
+                [
+                    f
+                    for f in list(pool.get("files") or [])
+                    if str(f.get("id") or "").strip()
+                    and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
+                ]
+            )
+            for pool in collection_pools
+        }
+        print(
+            f"mirror_inventory_counts index_total_clips={index_total_clips} "
+            f"resolved_pool_total={sum(int(v) for v in mirror_pool_counts.values())} "
+            f"by_collection={json.dumps(mirror_pool_counts, sort_keys=True)}"
         )
+        stale_warn_hours = _mirror_warn_stale_hours()
+        if generated_utc:
+            try:
+                generated_dt = dt.datetime.fromisoformat(generated_utc.replace("Z", "+00:00"))
+                if generated_dt.tzinfo is None:
+                    generated_dt = generated_dt.replace(tzinfo=dt.timezone.utc)
+                age_h = max(0.0, (dt.datetime.now(dt.timezone.utc) - generated_dt.astimezone(dt.timezone.utc)).total_seconds() / 3600.0)
+                print(
+                    f"mirror_freshness index_object=gs://{mirror_bucket}/{mirror_index_object} "
+                    f"generated_utc={generated_utc} age_hours={age_h:.2f} warn_hours={stale_warn_hours:.2f}"
+                )
+                if stale_warn_hours > 0.0 and age_h > stale_warn_hours:
+                    print(
+                        f"mirror_freshness_warn index_object=gs://{mirror_bucket}/{mirror_index_object} "
+                        f"age_hours={age_h:.2f} threshold_hours={stale_warn_hours:.2f}"
+                    )
+            except Exception:
+                print(
+                    f"mirror_freshness_warn index_object=gs://{mirror_bucket}/{mirror_index_object} "
+                    f"reason=invalid_generated_utc value={generated_utc!r}"
+                )
     clip_count = len(base_cuts)
     required_runs = _required_run_count(number_of_videos, clip_count)
     preset_sheet_id = str(cfg.get("Executive Preset File ID") or "").strip()
@@ -823,7 +1027,10 @@ def main() -> int:
             previous_collection_num=previous_collection_num,
         )
         run_collection_num = ",".join(str(pool.get("collection_num") or "") for pool in selected_pools)
-        run_collection_folder_id = clips_library_folder_id
+        if clips_source_mode == "gcs_mirror":
+            run_collection_folder_id = f"gs://{mirror_bucket}/{mirror_prefix}"
+        else:
+            run_collection_folder_id = clips_library_folder_id
         run_files: list[dict[str, str]] = []
         seen_run_files: set[tuple[str, str]] = set()
         for pool in selected_pools:
@@ -869,6 +1076,49 @@ def main() -> int:
                 }
             )
             run_cuts_with_exec.append(cut_row)
+
+        pool_counts_by_collection: dict[str, int] = {}
+        for row in run_files:
+            coll = str(row.get("collection_num") or "").strip()
+            if not coll:
+                continue
+            pool_counts_by_collection[coll] = int(pool_counts_by_collection.get(coll, 0)) + 1
+        manifest_counts_by_collection: dict[str, int] = {}
+        for row in clips:
+            coll = str(row.get("collection_num") or "").strip()
+            if not coll:
+                continue
+            manifest_counts_by_collection[coll] = int(manifest_counts_by_collection.get(coll, 0)) + 1
+        print(
+            f"mirror_selection_metrics run_index={i+1}/{required_runs} "
+            f"pool_clip_count={len(run_files)} manifest_clip_count={len(clips)} "
+            f"pool_by_collection={json.dumps(pool_counts_by_collection, sort_keys=True)} "
+            f"manifest_by_collection={json.dumps(manifest_counts_by_collection, sort_keys=True)}"
+        )
+
+        manifest_category_counts = _collection_category_counts(clips)
+        missing_events: list[str] = []
+        for cut_idx, cut_row in enumerate(run_cuts_with_exec, start=1):
+            collection_num = str(cut_row.get("collection_num") or "").strip()
+            stitch_preset = str(cut_row.get("stitch_preset") or "").strip()
+            required_categories = _extract_stitch_categories(stitch_preset)
+            available = set((manifest_category_counts.get(collection_num) or {}).keys())
+            missing = [cat for cat in required_categories if cat not in available]
+            if missing:
+                missing_events.append(
+                    f"cut={cut_idx} filename={cut_row.get('filename')} collection={collection_num} "
+                    f"required={required_categories} available={sorted(list(available))} missing={missing}"
+                )
+        print(
+            f"mirror_category_metrics run_index={i+1}/{required_runs} "
+            f"missing_events={len(missing_events)} category_counts={json.dumps(manifest_category_counts, sort_keys=True)}"
+        )
+        if clips_source_mode == "gcs_mirror" and missing_events:
+            raise RuntimeError(
+                "Mirror category coverage check failed before queueing render job: "
+                + " | ".join(missing_events)
+            )
+
         if run_cuts_with_exec:
             first_cut = run_cuts_with_exec[0]
             effective_preset["stitch_preset"] = str(first_cut.get("stitch_preset") or effective_preset["stitch_preset"])
@@ -887,6 +1137,12 @@ def main() -> int:
                 "audio_drive_file_id": audio_id,
                 "lyrics_srt_drive_file_id": lyrics_id,
                 "copy_srt_drive_file_id": copy_id or "",
+                "clips_source": {
+                    "mode": clips_source_mode,
+                    "mirror_bucket": mirror_bucket if clips_source_mode == "gcs_mirror" else "",
+                    "mirror_prefix": mirror_prefix if clips_source_mode == "gcs_mirror" else "",
+                    "mirror_index_object": mirror_index_object if clips_source_mode == "gcs_mirror" else "",
+                },
             },
             "stitch": {
                 "preset": effective_preset["stitch_preset"],
