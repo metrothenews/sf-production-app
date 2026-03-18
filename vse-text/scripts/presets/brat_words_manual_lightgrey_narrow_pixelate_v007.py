@@ -78,6 +78,15 @@ def get_preset() -> Dict[str, Any]:
     ml["word_align_x"] = "CENTER"
     ml["word_align_y"] = "CENTER"
 
+    reveal = dict(p.get("reveal", {}) or {})
+    auto_speed = dict(reveal.get("auto_speed", {}) or {})
+    auto_speed["enabled"] = True
+    auto_speed["max_speedup"] = 2.4
+    auto_speed["baseline_quantile"] = 0.70
+    auto_speed["gamma"] = 1.2
+    reveal["auto_speed"] = auto_speed
+    p["reveal"] = reveal
+
     p["manual_layout"] = ml
     return p
 

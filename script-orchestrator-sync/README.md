@@ -8,6 +8,42 @@ Sync utility that reads rows from a source sheet, applies mapping rules from a c
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 
+## Deep Observability + Forensics
+
+Pipeline v1 now supports structured run telemetry and auto-forensics on failure.
+
+Default high-detail envs (see `.env.prod.example`):
+- `PIPELINE_OBSERVABILITY_MODE=deep`
+- `PIPELINE_JSON_EVENTS_ENABLED=1`
+- `PIPELINE_STAGE_HEARTBEAT_SECONDS=20`
+- `PIPELINE_STAGE_TIMEOUT_SECONDS=0`
+- `PIPELINE_FORENSICS_ON_FAILURE=1`
+- `PIPELINE_FORENSICS_FRAME_SAMPLES=12`
+- `PIPELINE_FORENSICS_UPLOAD=1`
+
+Generated artifacts:
+- `logs/events.jsonl` per run
+- `diagnostics/<run_id>/summary.json` and `diagnostics/<run_id>/bundle.zip` on failures
+
+Quick preflight before running a batch:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+.venv_local/bin/python scripts/trigger_render_batch.py --preflight-only
+# or: make run-batch-preflight
+```
+
+Watch live structured events:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+.venv_local/bin/python scripts/watch_render_events.py --follow
+```
+
+If you need to reduce overhead temporarily:
+- `PIPELINE_OBSERVABILITY_MODE=basic`
+- `PIPELINE_FORENSICS_ON_FAILURE=0`
+
 ## Containerized Dev (Hot Reload + Local Editing)
 
 This repo now includes a dev-first container setup that keeps editing/debugging easy:
@@ -467,7 +503,7 @@ CONTROL_SHEET_ID=<your_control_sheet_id> make compile-config
 Optional env vars:
 - `CONFIG_SHEET_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `CONFIG_TAB` (default: `Sheet1`)
-- `CONFIG_RANGE` (default: `A1:AZ2`)
+- `CONFIG_RANGE` (default: `A1:ZZ2`)
 - `CLIPS_LIBRARY_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `OUTPUT_PARENT_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `ASSETS_FOLDER_ID` (optional folder used for filename->Drive id lookup)
@@ -478,6 +514,12 @@ Category inference used by compiler:
 - Built-in mappings include: `people/person -> P`, `cars/car -> C`, `fireworks/firework -> F`,
   `urban/city -> U`, `money/cash -> M`, `travel/trip -> T`.
 - If no keyword match exists, the first alphabetic token initial is used.
+
+Song title overlay fields (config row):
+- `Display Song Name?`: when `TRUE`, render a static song-title overlay.
+- `Song Name`: required when `Display Song Name?` is `TRUE`.
+- Behavior: title is rendered with the same font family/style as lyric captions, at `60%` of caption size,
+  centered near the top black bar, and held for the full rendered duration.
 
 ## One-Command Batch Run (Compile + Queue Drain + Progress)
 
@@ -503,35 +545,50 @@ Optional resilience tuning for Blender stages:
 - `PIPELINE_BLENDER_STAGE_RETRIES` (default: `1`) extra retries for `pipeline_v1` stitch/lyrics/copy stages
 - `PIPELINE_BLENDER_RETRY_DELAY_SECONDS` (default: `1`) delay between retries
 - `BLENDER_STAGE_RETRIES` / `BLENDER_STAGE_RETRY_DELAY_SECONDS` (same behavior for standalone `vse_text` / `vse_stitcher` renderers)
-- `PIPELINE_RENDER_END_PADDING_SECONDS` (default: `1.0`) adds safety padding to the cut horizon cap used by `pipeline_v1` render stages
-- `PIPELINE_PER_CUT_RENDER` (default: `0`) renders each manifest cut as its own stitch+lyrics pipeline when enabled (set `1` to opt in; default uses legacy full-length render then cut)
+- `PIPELINE_PER_CUT_RENDER` (default: `1`) keeps `pipeline_v1` in per-cut render mode (current build requires `1`)
+- `PIPELINE_EFFECTS_PASS2_ENABLED` (default: `1`) enables two-pass stitch flow: `stitch(base_only) -> effects(pass2) -> lyrics/copy`
+- `PIPELINE_EFFECTS_PASS2_STRICT` (default: `1`) fail cut/run when effects pass contract checks fail
+- `PIPELINE_EFFECTS_PASS2_KEEP_PLAN_ON_SUCCESS` (default: `0`) keep per-cut effects plan JSON locally after success
 - `BLENDER_BIN` (default: auto-detect mac path, otherwise `blender`)
-- `VSE_STITCHER_SCRIPT_PATH` / `VSE_TEXT_SCRIPT_PATH` (override external script locations; defaults resolve from workspace sibling repos)
+- `VSE_STITCHER_SCRIPT_PATH` / `VSE_EFFECTS_SCRIPT_PATH` / `VSE_TEXT_SCRIPT_PATH` (override external script locations; defaults resolve from workspace sibling repos)
 
 When both vars are set, each progress snapshot also writes `percent` (0-100) into that sheet cell.
 
 Render horizon cap (important):
-- `pipeline_v1` now computes `max_cut_end_s` from manifest cuts and caps stage render length to:
-  - `render_end_seconds = max_cut_end_s + PIPELINE_RENDER_END_PADDING_SECONDS`
-- The cap is passed to stitch/lyrics/copy Blender scripts via `--render-end-seconds`.
-- This prevents rendering the unused tail of long source audio/video when requested cuts are short.
+- In per-cut mode, each cut trims audio/SRT to that cut window first, then each short is rendered directly to that cut duration.
+- The pipeline no longer relies on full-length render-then-cut video behavior for `pipeline_v1`.
 
 Preset/category behavior in `pipeline_v1`:
 - Per-cut stitch presets are honored directly from `manifest.cuts[*].stitch_preset`.
+- Stitch preset grammar is `digits + optional modifiers + category`, where category is always the final letter.
+- Allowed modifiers: `b`, `w`, `s`, `sb`, `sw` (empty modifier means normal behavior).
+- Example extended preset: `4p4sbc4f4t2sp2u2c2wm`.
 - Category letters in preset DSL (for example `4p4c4f4t2p2u2c2m`) map to category-specific clip pools.
 - Random selection is constrained to the current category only.
 - Clips do not repeat within a category until that category pool is exhausted, then the pool reshuffles.
 - Missing required categories now fail loudly instead of silently falling back to mixed/random buckets.
 - Legacy manifests with uncategorized clips still run: uncategorized clips are used as fallback pools.
+- Two-pass modifier contract:
+  - Stitch pass renders base media only and writes a deterministic effects plan sidecar.
+  - Effects pass applies frame-level replacements from the sidecar before text overlay.
+  - `b` / `w`: replace frame 1 of that shot with black/white (shot duration unchanged).
+  - `s`: interlace two different clips frame-by-frame.
+  - `sb` / `sw`: interlace color and one clip frame-by-frame (color-first).
+  - If `s` has insufficient unique clips, planner marks fallback-to-normal for that segment and emits a warning.
 
 Subtitle behavior in `pipeline_v1` per-cut mode:
 - Per-cut SRT slicing now auto-normalizes Resolve-style hour-offset cues (`01:00:00,000+`) before overlap checks.
 - SRT time parsing accepts both comma and dot millisecond separators.
-- Global lyric timing includes a temporary `500ms` advance (`HARDCODED_LYRIC_ADVANCE_MS`) to bring on-screen lyrics earlier.
+- Global lyric timing includes a temporary `150ms` advance (`HARDCODED_LYRIC_ADVANCE_MS`) to bring on-screen lyrics earlier.
 - SRT text normalization preserves intended line breaks (`<br>`, `\\N`, `\\n`) and wraps overlong lines in `linebreak_mode="srt"` to avoid off-screen overflow.
 - Edge cues that land exactly on cut boundaries are kept as tiny clips to avoid dropped first/last lyric words.
-- If per-cut mode finds zero lyric cues across all cuts while the main lyrics SRT is non-empty, the agent automatically falls back to legacy full-length render for that run.
-- If legacy full-length still cannot produce usable lyrics/copy overlay outputs while lyrics cues exist, the run fails loudly instead of silently shipping base-only shorts.
+- If per-cut mode finds zero lyric cues across all cuts while the main lyrics SRT is non-empty, the run fails loudly.
+- Auto-speed reveal (preset-driven): when `reveal.auto_speed.enabled=true`, word reveal speed is computed per cue from `words/second`.
+- Auto-speed knobs: `reveal.auto_speed.baseline_quantile`, `max_speedup`, `gamma`, `min_words_for_baseline`, `fallback_baseline_wps`.
+- Per-cut baseline anchoring: in per-cut `pipeline_v1`, the first lyric-bearing cut computes the auto-speed baseline and later cuts reuse that same baseline.
+  This keeps verse timing stable in `clip_001` while allowing chorus cuts (for example `clip_002`) to accelerate deterministically.
+- Renderer override hook: `vse-text` supports `--auto-baseline-wps <float>` (plumbed by render agent when anchoring baseline across cuts).
+- Behavior contract: sparse cues reveal faster (up to `max_speedup`) then hold full cue text until cue end; dense cues stay near `1x`.
 
 API trigger (for button integration) uses the same underlying flow:
 
@@ -571,26 +628,25 @@ make run-batch
 
 Notes:
 - This command compiles current config row(s), then drains queued render jobs.
+- A run can finish local renders before Drive uploads complete. If the parent batch process is interrupted, local MP4s may exist under
+  `so_work/<run_id>/outputs` while no new file appears in Drive yet.
 - If using a service-account key JSON instead of user ADC, Drive uploads may fail with
   `storageQuotaExceeded` unless you are writing to a properly configured Shared Drive.
 
+Local retention controls (both pipeline and local render-agent flows):
+- `PIPELINE_UPLOAD_VERIFY_MODE=size` (default): after upload, confirms Drive file metadata exists and `size` matches local bytes.
+- `PIPELINE_LOCAL_CLEANUP_ON_SUCCESS=1` (default): removes local run working files after successful completion.
+- `PIPELINE_LOCAL_CLEANUP_ON_FAILURE=logs_only` (default): on failure, deletes local media/intermediates and keeps only logs.
+
 ### Clip Collection Folder Behavior
 
-- Collection toggles are read from config keys matching `V Collection N` (for example:
-  `V Collection 1` through `V Collection 6`).
-- Each enabled collection resolves to its own folder under `CLIPS_LIBRARY_FOLDER_ID` (default root:
-  `YOUR_GOOGLE_SHEET_ID`), by matching direct subfolder names like:
-  `V Collection N` or `Collection N`.
-- Optional explicit folder-id columns are supported and take precedence, for example:
-  `V Collection 2 Folder ID`.
-- Clip pools stay isolated per collection (no mixing).
-- When multiple collections are enabled, compiler alternates by run:
-  `r01 -> Collection 1`, `r02 -> Collection 2`, `r03 -> Collection 3`, `r04 -> Collection 4`,
-  `r05 -> Collection 5`, `r06 -> Collection 6`, then repeat.
-- Alternation is per full-length render run only (not per cut clip). All cut clips produced from a single
-  run use that run's selected collection.
-- Example: if 2 cut clips are enabled and 17 videos are requested, compiler creates 9 runs and assigns
-  collections as `1,2,3,4,5,6,1,2,3`; the final run is trimmed to output only one cut clip.
+- Collections are auto-discovered from direct subfolders under `CLIPS_LIBRARY_FOLDER_ID` (default root:
+  `YOUR_GOOGLE_SHEET_ID`) with names matching exactly `collection-<number>`.
+- Subfolders with any other naming pattern are ignored (for example `old-collection-1`).
+- New matching folders (for example `collection-8`) are picked up automatically with no config changes.
+- Each short output clip is assigned a random collection, and the selector enforces no consecutive repeats
+  across the full batch.
+- Collection assignment is per cut clip, not per full-length run.
 - Each selected collection folder is scanned recursively (up to `CLIPS_LIBRARY_MAX_DEPTH`, default `4`)
   when building that collection's pool.
 
@@ -647,6 +703,25 @@ PYTHONPATH=src .venv_local/bin/python scripts/seed_one_render_job.py \
   --select-mode shuffle_seeded \
   --select-seed 12345 \
   --output-folder-id YOUR_GOOGLE_SHEET_ID
+```
+
+## Local Artifact Prune Utility
+
+One-time cleanup helper for stale local render artifacts under temp `so_work/` and repo `work/`.
+
+Dry-run (default behavior):
+```bash
+PYTHONPATH=src .venv_local/bin/python scripts/prune_local_render_artifacts.py --dry-run
+```
+
+Apply deletion:
+```bash
+PYTHONPATH=src .venv_local/bin/python scripts/prune_local_render_artifacts.py --apply
+```
+
+Keep only `logs/` under run directories:
+```bash
+PYTHONPATH=src .venv_local/bin/python scripts/prune_local_render_artifacts.py --apply --failure-logs-only
 ```
 
 Permissions reminder:

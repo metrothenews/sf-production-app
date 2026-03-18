@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -18,15 +17,35 @@ _SPEC.loader.exec_module(render_agent)
 def test_run_to_log_retries_then_succeeds(monkeypatch, tmp_path) -> None:
     calls = {"n": 0}
 
-    def _fake_run(cmd, **kwargs):
-        calls["n"] += 1
-        stdout = kwargs.get("stdout")
-        stdout.write(f"attempt={calls['n']}\n".encode("utf-8"))
-        if calls["n"] == 1:
-            return SimpleNamespace(returncode=1)
-        return SimpleNamespace(returncode=0)
+    class _FakePopen:
+        def __init__(self, _cmd, stdout=None, stderr=None):
+            del stderr
+            calls["n"] += 1
+            self.returncode = None
+            self._poll_count = 0
+            if stdout is not None:
+                stdout.write(f"attempt={calls['n']}\n".encode("utf-8"))
 
-    monkeypatch.setattr(render_agent.subprocess, "run", _fake_run)
+        def poll(self):
+            self._poll_count += 1
+            if self._poll_count == 1:
+                return None
+            self.returncode = 1 if calls["n"] == 1 else 0
+            return self.returncode
+
+        def wait(self, timeout=None):
+            del timeout
+            return int(self.returncode or 0)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(render_agent.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(render_agent.time, "sleep", lambda _x: None)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_timeout_seconds", lambda: 0.0)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_heartbeat_seconds", lambda: 0.0)
+    render_agent._init_event_logger(run_id="r_test", render_job_id="j_test", path=str(tmp_path / "events.jsonl"))
+
     log_path = tmp_path / "stage.log"
     render_agent._run_to_log(
         ["blender", "--fake"],
@@ -41,18 +60,79 @@ def test_run_to_log_retries_then_succeeds(monkeypatch, tmp_path) -> None:
 
 
 def test_run_to_log_failure_includes_tail(monkeypatch, tmp_path) -> None:
-    def _fake_run(cmd, **kwargs):
-        stdout = kwargs.get("stdout")
-        stdout.write(b"Segmentation fault\n")
-        return SimpleNamespace(returncode=139)
+    class _FakePopen:
+        def __init__(self, _cmd, stdout=None, stderr=None):
+            del stderr
+            self.returncode = None
+            self._poll_count = 0
+            if stdout is not None:
+                stdout.write(b"Segmentation fault\n")
 
-    monkeypatch.setattr(render_agent.subprocess, "run", _fake_run)
+        def poll(self):
+            self._poll_count += 1
+            if self._poll_count == 1:
+                return None
+            self.returncode = 139
+            return 139
+
+        def wait(self, timeout=None):
+            del timeout
+            return int(self.returncode or 139)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(render_agent.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(render_agent.time, "sleep", lambda _x: None)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_timeout_seconds", lambda: 0.0)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_heartbeat_seconds", lambda: 0.0)
+    render_agent._init_event_logger(run_id="r_test", render_job_id="j_test", path=str(tmp_path / "events.jsonl"))
+
     log_path = tmp_path / "stage_fail.log"
     with pytest.raises(RuntimeError, match=r"log_tail=.*Segmentation fault"):
         render_agent._run_to_log(
             ["blender", "--fake"],
             str(log_path),
             stage="stitch",
+            retries=0,
+            retry_delay_seconds=0.0,
+        )
+
+
+def test_run_to_log_timeout(monkeypatch, tmp_path) -> None:
+    class _FakePopen:
+        def __init__(self, _cmd, stdout=None, stderr=None):
+            del stdout, stderr
+            self.returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            del timeout
+            return -9
+
+        def kill(self):
+            self.returncode = -9
+
+    ticks = {"n": 0}
+
+    def _fake_monotonic():
+        ticks["n"] += 1
+        return ticks["n"] * 0.1
+
+    monkeypatch.setattr(render_agent.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(render_agent.time, "sleep", lambda _x: None)
+    monkeypatch.setattr(render_agent.time, "monotonic", _fake_monotonic)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_timeout_seconds", lambda: 0.2)
+    monkeypatch.setattr(render_agent, "_pipeline_stage_heartbeat_seconds", lambda: 0.0)
+    render_agent._init_event_logger(run_id="r_test", render_job_id="j_test", path=str(tmp_path / "events.jsonl"))
+
+    with pytest.raises(RuntimeError, match=r"timed out"):
+        render_agent._run_to_log(
+            ["blender", "--fake"],
+            str(tmp_path / "stage_timeout.log"),
+            stage="effects",
             retries=0,
             retry_delay_seconds=0.0,
         )
@@ -94,3 +174,4 @@ def test_pick_cut_source_video_raises_when_both_short(monkeypatch) -> None:
             candidate_label="lyrics",
             candidate_log_path="/tmp/lyrics.log",
         )
+

@@ -22,11 +22,12 @@ from so_sync.render_repo import find_render_job_by_id, upsert_render_job  # noqa
 
 CONFIG_SHEET_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 CONFIG_TAB_DEFAULT = "Sheet1"
-CONFIG_RANGE_DEFAULT = "A1:AZ2"
+CONFIG_RANGE_DEFAULT = "A1:ZZ2"
 CLIPS_LIBRARY_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 OUTPUT_PARENT_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+COLLECTION_FOLDER_NAME_RE = re.compile(r"^collection-(\d+)$", flags=re.IGNORECASE)
 _CATEGORY_TOKEN_RE = re.compile(r"[a-z]+")
 _CATEGORY_KEYWORDS: Mapping[str, str] = {
     "people": "P",
@@ -150,6 +151,34 @@ def _extract_first_values_matrix(data: Dict[str, Any]) -> list[list[Any]]:
 def normalize_bool(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return text in {"true", "1", "yes", "y"}
+
+
+def _cfg_value_by_names(cfg: Mapping[str, Any], names: Iterable[str], default: Any = "") -> Any:
+    for name in names:
+        if name in cfg:
+            return cfg.get(name)
+    by_lower: dict[str, Any] = {str(k).strip().lower(): v for k, v in cfg.items()}
+    for name in names:
+        hit = by_lower.get(str(name).strip().lower())
+        if hit is not None:
+            return hit
+    return default
+
+
+def resolve_song_title_overlay(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    enabled = normalize_bool(
+        _cfg_value_by_names(
+            cfg,
+            ["Display Song Name?", "Display Song Name"],
+            default=False,
+        )
+    )
+    if not enabled:
+        return {"enabled": False, "text": ""}
+    song_name = str(_cfg_value_by_names(cfg, ["Song Name"], default="") or "").strip()
+    if not song_name:
+        raise RuntimeError("Display Song Name? is enabled but Song Name is empty.")
+    return {"enabled": True, "text": song_name}
 
 
 def resolve_stitch_bpm(cfg: Mapping[str, Any]) -> float:
@@ -333,6 +362,7 @@ def build_manifest_clips(
             "name": str(f.get("name") or ""),
             "mimeType": str(f.get("mimeType") or ""),
             "category": _normalize_category_key(f.get("category") or ""),
+            "collection_num": str(f.get("collection_num") or "").strip(),
         }
         for f in files
         if str(f.get("id") or "").strip() and _is_video_like(str(f.get("name") or ""), str(f.get("mimeType") or ""))
@@ -347,6 +377,9 @@ def build_manifest_clips(
         cat = str(row.get("category") or "").strip()
         if cat:
             clip_row["category"] = cat
+        collection_num = str(row.get("collection_num") or "").strip()
+        if collection_num:
+            clip_row["collection_num"] = collection_num
         out.append(clip_row)
     return out
 
@@ -392,50 +425,14 @@ def collect_files_from_folder_tree(
     return files
 
 
-def _enabled_collection_numbers(cfg: Mapping[str, Any]) -> list[int]:
-    out: list[int] = []
-    for key, raw in cfg.items():
-        m = re.match(r"^V Collection\s+(\d+)$", str(key or "").strip(), flags=re.IGNORECASE)
-        if not m:
-            continue
-        if not normalize_bool(raw):
-            continue
-        num = int(m.group(1))
-        if num not in out:
-            out.append(num)
-    out.sort()
-    return out
-
-
-def _normalized_collection_folder_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
-
-
-def _collection_label_aliases(collection_num: int) -> list[str]:
-    n = int(collection_num)
-    return [
-        _normalized_collection_folder_name(f"V Collection {n}"),
-        _normalized_collection_folder_name(f"Collection {n}"),
-        _normalized_collection_folder_name(f"VCollection{n}"),
-        _normalized_collection_folder_name(f"Collection{n}"),
-    ]
-
-
-def _read_collection_folder_id_from_cfg(cfg: Mapping[str, Any], collection_num: int) -> str:
-    n = int(collection_num)
-    candidates = [
-        f"V Collection {n} Folder ID",
-        f"V Collection {n} Drive Folder ID",
-        f"V Collection {n} ID",
-        f"Collection {n} Folder ID",
-        f"Collection {n} Drive Folder ID",
-        f"Collection {n} ID",
-    ]
-    for key in candidates:
-        value = str(cfg.get(key) or "").strip()
-        if drive_reference_kind(value) == "id":
-            return value
-    return ""
+def _collection_num_from_folder_name(name: str) -> int | None:
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    m = COLLECTION_FOLDER_NAME_RE.match(raw)
+    if not m:
+        return None
+    return int(m.group(1))
 
 
 def resolve_collection_folder_ids(
@@ -444,44 +441,44 @@ def resolve_collection_folder_ids(
     drive_client: Any,
     root_folder_id: str,
 ) -> list[dict[str, str]]:
-    enabled = _enabled_collection_numbers(cfg)
-    if not enabled:
-        return []
-
+    _ = cfg  # Selection is inferred from Drive folder names only.
     direct_children = drive_client.list_files_in_folder(root_folder_id)
     folder_rows = [row for row in direct_children if str(row.get("mimeType") or "").strip() == DRIVE_FOLDER_MIME]
-    by_norm_name: Dict[str, str] = {}
+    grouped: dict[int, list[tuple[str, str]]] = {}
     for row in folder_rows:
         fid = str(row.get("id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        num = _collection_num_from_folder_name(name)
+        if num is None:
+            continue
         if not fid:
             continue
-        norm_name = _normalized_collection_folder_name(str(row.get("name") or ""))
-        if norm_name and norm_name not in by_norm_name:
-            by_norm_name[norm_name] = fid
+        grouped.setdefault(num, []).append((name, fid))
 
-    resolved: list[dict[str, str]] = []
-    for num in enabled:
-        explicit_id = _read_collection_folder_id_from_cfg(cfg, num)
-        if explicit_id:
-            resolved.append({"collection_num": str(num), "folder_id": explicit_id})
-            continue
-        found_id = ""
-        for alias in _collection_label_aliases(num):
-            hit = by_norm_name.get(alias, "")
-            if hit:
-                found_id = hit
-                break
-        if not found_id and num == 1 and len(folder_rows) == 1:
-            found_id = str(folder_rows[0].get("id") or "").strip()
-        if not found_id:
-            available = sorted(str(row.get("name") or "").strip() for row in folder_rows if str(row.get("name") or "").strip())
-            raise RuntimeError(
-                f"Unable to resolve folder for V Collection {num}. "
-                f"Expected a direct subfolder under clips root ({root_folder_id}) named like "
-                f"'V Collection {num}' or 'Collection {num}', or set an explicit folder id column. "
-                f"available_subfolders={available}"
-            )
-        resolved.append({"collection_num": str(num), "folder_id": found_id})
+    duplicates = {num: rows for num, rows in grouped.items() if len(rows) > 1}
+    if duplicates:
+        parts = []
+        for num in sorted(duplicates.keys()):
+            rows = duplicates[num]
+            ids = ",".join(str(fid) for _, fid in rows)
+            names = ",".join(str(name) for name, _ in rows)
+            parts.append(f"collection-{num} names=[{names}] ids=[{ids}]")
+        raise RuntimeError(
+            "Duplicate collection folder numbers found under clips root. "
+            "Each collection-<number> must be unique. "
+            f"duplicates={parts}"
+        )
+
+    found: list[tuple[int, str]] = [(num, rows[0][1]) for num, rows in grouped.items()]
+    found.sort(key=lambda row: row[0])
+    if not found:
+        available = sorted(str(row.get("name") or "").strip() for row in folder_rows if str(row.get("name") or "").strip())
+        raise RuntimeError(
+            "No valid collection folders found under clips root. "
+            f"Expected direct subfolders named 'collection-<number>' under {root_folder_id}. "
+            f"available_subfolders={available}"
+        )
+    resolved: list[dict[str, str]] = [{"collection_num": str(num), "folder_id": fid} for num, fid in found]
     return resolved
 
 
@@ -586,7 +583,7 @@ def _render_job_id_for_iteration(base_job_id: str, iteration: int, total_runs: i
 
 def _required_run_count(number_of_videos: int, clip_count: int) -> int:
     if number_of_videos <= 0:
-        return 1
+        raise RuntimeError(f"Cannot compute run count: Number of Videos must be >= 1 (got {number_of_videos})")
     if clip_count <= 0:
         raise RuntimeError("Cannot compute run count: enabled clip count is zero")
     return max(1, math.ceil(number_of_videos / clip_count))
@@ -598,6 +595,37 @@ def _collection_pool_for_run(collection_pools: list[Mapping[str, Any]], run_inde
     if run_index < 0:
         raise ValueError(f"run_index must be >= 0, got {run_index}")
     return collection_pools[run_index % len(collection_pools)]
+
+
+def _select_random_collection_pools_for_cuts(
+    collection_pools: list[Mapping[str, Any]],
+    *,
+    cut_count: int,
+    rng: random.Random,
+    previous_collection_num: str = "",
+) -> tuple[list[Mapping[str, Any]], str]:
+    if not collection_pools:
+        raise RuntimeError("No collection pools available")
+    if cut_count <= 0:
+        return [], str(previous_collection_num or "")
+
+    previous = str(previous_collection_num or "")
+    unique_nums = {str(pool.get("collection_num") or "").strip() for pool in collection_pools}
+    unique_nums.discard("")
+    if len(unique_nums) <= 1 and cut_count > 1:
+        raise RuntimeError(
+            "At least two 'collection-<number>' folders are required for non-consecutive per-clip selection."
+        )
+
+    out: list[Mapping[str, Any]] = []
+    for _ in range(cut_count):
+        candidates = [pool for pool in collection_pools if str(pool.get("collection_num") or "").strip() != previous]
+        if not candidates:
+            candidates = list(collection_pools)
+        picked = candidates[int(rng.randrange(0, len(candidates)))]
+        out.append(picked)
+        previous = str(picked.get("collection_num") or "").strip()
+    return out, previous
 
 
 def _normalize_text_preset_name(raw: str) -> str:
@@ -672,7 +700,16 @@ def main() -> int:
     naming_convention = str(cfg.get("Naming Convention") or "").strip()
     if not naming_convention:
         raise RuntimeError("Missing required config field: Naming Convention")
-    number_of_videos = int(str(cfg.get("Number of Videos") or "0").strip())
+    song_title_overlay = resolve_song_title_overlay(cfg)
+    raw_number_of_videos = str(cfg.get("Number of Videos") or "").strip()
+    try:
+        number_of_videos = int(raw_number_of_videos)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid Number of Videos value {raw_number_of_videos!r}; expected integer >= 1."
+        ) from exc
+    if number_of_videos <= 0:
+        raise RuntimeError(f"Number of Videos must be >= 1 (got {number_of_videos}).")
     exec_preset_name = str(cfg.get("Executive Preset") or "").strip()
     preset = EXEC_PRESET_MAP.get(exec_preset_name)
     if not preset:
@@ -721,7 +758,7 @@ def main() -> int:
         root_folder_id=clips_library_folder_id,
     )
     if not collection_folders:
-        raise RuntimeError("No enabled video collections found. Set one or more `V Collection N` toggles to TRUE.")
+        raise RuntimeError("No collection folders found. Add direct subfolders named `collection-<number>`.")
     collection_pools: list[dict[str, Any]] = []
     for row in collection_folders:
         folder_id = str(row.get("folder_id") or "").strip()
@@ -738,7 +775,7 @@ def main() -> int:
         ]
         if not video_files:
             raise RuntimeError(
-                f"V Collection {collection_num} resolved to folder {folder_id}, but no video clips were found."
+                f"collection-{collection_num} resolved to folder {folder_id}, but no video clips were found."
             )
         collection_pools.append(
             {
@@ -760,6 +797,7 @@ def main() -> int:
     queued_job_ids: list[str] = []
     manifest_ids: list[str] = []
     rng = random.SystemRandom()
+    previous_collection_num = ""
     for i in range(required_runs):
         preset_row = dynamic_preset_rows[i % len(dynamic_preset_rows)]
         effective_preset = dict(preset)
@@ -778,12 +816,31 @@ def main() -> int:
         remaining = max(0, number_of_videos - (i * clip_count))
         if remaining > 0 and len(run_cuts) > remaining:
             run_cuts = run_cuts[:remaining]
-        collection_row = _collection_pool_for_run(collection_pools, i)
-        run_collection_folder_id = str(collection_row.get("folder_id") or "").strip()
-        run_collection_num = str(collection_row.get("collection_num") or "")
+        selected_pools, previous_collection_num = _select_random_collection_pools_for_cuts(
+            collection_pools,
+            cut_count=len(run_cuts),
+            rng=rng,
+            previous_collection_num=previous_collection_num,
+        )
+        run_collection_num = ",".join(str(pool.get("collection_num") or "") for pool in selected_pools)
+        run_collection_folder_id = clips_library_folder_id
+        run_files: list[dict[str, str]] = []
+        seen_run_files: set[tuple[str, str]] = set()
+        for pool in selected_pools:
+            selected_num = str(pool.get("collection_num") or "").strip()
+            for item in list(pool.get("files") or []):
+                file_id = str(item.get("id") or "").strip()
+                key = (selected_num, file_id)
+                if not file_id or key in seen_run_files:
+                    continue
+                seen_run_files.add(key)
+                row = dict(item)
+                row["collection_num"] = selected_num
+                run_files.append(row)
+
         clips: list[dict[str, str]] = []
         clips = build_manifest_clips(
-            list(collection_row.get("files") or []),
+            run_files,
             seed=run_seed,
             max_clips=80,
         )
@@ -808,6 +865,7 @@ def main() -> int:
                     "fps": int(cut_preset["fps"]),
                     "aspect": str(cut_preset["aspect"]),
                     "bg_mode": str(cut_preset["bg_mode"]),
+                    "collection_num": str(selected_pools[cut_idx].get("collection_num") or ""),
                 }
             )
             run_cuts_with_exec.append(cut_row)
@@ -842,6 +900,10 @@ def main() -> int:
                 "bg_mode": effective_preset["bg_mode"],
                 "fps": int(effective_preset["fps"]),
                 "aspect": str(effective_preset["aspect"]),
+                "song_title": {
+                    "enabled": bool(song_title_overlay.get("enabled")),
+                    "text": str(song_title_overlay.get("text") or ""),
+                },
             },
             "cuts": run_cuts_with_exec,
         }
@@ -859,7 +921,7 @@ def main() -> int:
             existing,
             render_job_id=render_job_id,
             naming_convention=naming_convention,
-            clips_library_folder_id=run_collection_folder_id,
+            clips_library_folder_id=clips_library_folder_id,
             manifest_drive_file_id=manifest_drive_file_id,
             audio_id=audio_id,
             lyrics_id=lyrics_id,
@@ -888,6 +950,8 @@ def main() -> int:
     print(f"cuts_generated={len(base_cuts)}")
     print(f"audio_drive_file_id={audio_id}")
     print(f"stitch_bpm={stitch_bpm:g}")
+    print(f"display_song_name={1 if song_title_overlay.get('enabled') else 0}")
+    print(f"song_name={song_title_overlay.get('text') or ''}")
     print(f"lyrics_srt_drive_file_id={lyrics_id}")
     print(f"copy_srt_drive_file_id={copy_id or ''}")
     print(f"queued_jobs={json.dumps(queued_job_ids)}")

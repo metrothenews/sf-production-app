@@ -4,8 +4,6 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
-from googleapiclient.http import MediaFileUpload
-
 from so_sync.drive_upload import DriveUploadError, from_env as drive_upload_from_env
 
 
@@ -32,22 +30,15 @@ def upload_file_to_folder(local_path: str, folder_id: str, name: str | None = No
     path = Path(local_path)
     if not path.exists():
         raise DriveUploadError(f"upload source missing: {local_path}")
-    body = {
-        "name": name or path.name,
-        "parents": [folder_id],
-    }
-    media = MediaFileUpload(str(path), mimetype=_mime_for(str(path)), resumable=False)
+    target_name = str(name or path.name)
     try:
-        resp = client.service.files().create(
-            body=body,
-            media_body=media,
-            fields="id,name,webViewLink,webContentLink",
-        ).execute()
+        file_id = client.upload_file(str(path), folder_id, _mime_for(str(path)), name=target_name)
+        metadata = client.get_file_metadata(file_id)
     except Exception as exc:
         raise DriveUploadError(f"upload failed local_path={local_path} folder_id={folder_id} error={exc}") from exc
     return {
-        "file_id": str(resp.get("id") or ""),
-        "name": str(resp.get("name") or body["name"]),
-        "webViewLink": str(resp.get("webViewLink") or ""),
-        "webContentLink": str(resp.get("webContentLink") or ""),
+        "file_id": str(metadata.get("id") or file_id),
+        "name": str(metadata.get("name") or target_name),
+        "webViewLink": "",
+        "webContentLink": "",
     }

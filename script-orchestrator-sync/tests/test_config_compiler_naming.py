@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "compile_config_to_render_job.py"
 _SPEC = importlib.util.spec_from_file_location("compile_config_to_render_job", _SCRIPT_PATH)
@@ -50,6 +52,14 @@ def test_build_manifest_clips_carries_category_when_present() -> None:
     ]
     clips = compiler.build_manifest_clips(files, seed=1, max_clips=10)
     assert clips == [{"drive_file_id": "id_p", "label": "c001", "category": "P"}]
+
+
+def test_build_manifest_clips_carries_collection_num_when_present() -> None:
+    files = [
+        {"id": "id_1", "name": "clip_a.mp4", "mimeType": "video/mp4", "collection_num": "8"},
+    ]
+    clips = compiler.build_manifest_clips(files, seed=1, max_clips=10)
+    assert clips == [{"drive_file_id": "id_1", "label": "c001", "collection_num": "8"}]
 
 
 def test_collect_files_from_folder_tree_recurses_subfolders() -> None:
@@ -107,44 +117,50 @@ def test_collect_files_from_folder_tree_infers_category_from_top_level_folder() 
     assert by_id["c1"]["category"] == "C"
 
 
-def test_enabled_collection_numbers_detects_checked_toggles() -> None:
-    cfg = {
-        "V Collection 1": "TRUE",
-        "V Collection 2": "false",
-        "V Collection 3": "1",
-    }
-    assert compiler._enabled_collection_numbers(cfg) == [1, 3]
+def test_collection_num_from_folder_name_accepts_collection_dash_number() -> None:
+    assert compiler._collection_num_from_folder_name("collection-1") == 1
+    assert compiler._collection_num_from_folder_name("Collection-08") == 8
+    assert compiler._collection_num_from_folder_name("old-collection-1") is None
+    assert compiler._collection_num_from_folder_name("collection one") is None
 
 
-def test_resolve_collection_folder_ids_by_name() -> None:
+def test_resolve_collection_folder_ids_uses_collection_dash_number_pattern_only() -> None:
     class _Drive:
         def list_files_in_folder(self, folder_id: str):
             assert folder_id == "clips_root"
             return [
-                {"id": "fold_1", "name": "V Collection 1", "mimeType": "application/vnd.google-apps.folder"},
-                {"id": "fold_2", "name": "Collection 2", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "fold_old", "name": "old-collection-1", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "fold_2", "name": "collection-2", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "fold_8", "name": "collection-8", "mimeType": "application/vnd.google-apps.folder"},
             ]
 
-    cfg = {
-        "V Collection 1": "TRUE",
-        "V Collection 2": "TRUE",
-    }
+    cfg = {}
     out = compiler.resolve_collection_folder_ids(cfg, drive_client=_Drive(), root_folder_id="clips_root")
     assert out == [
-        {"collection_num": "1", "folder_id": "fold_1"},
         {"collection_num": "2", "folder_id": "fold_2"},
+        {"collection_num": "8", "folder_id": "fold_8"},
     ]
 
 
-def test_resolve_collection_folder_ids_prefers_explicit_id_column() -> None:
+def test_resolve_collection_folder_ids_raises_when_no_matching_collection_folders() -> None:
     class _Drive:
         def list_files_in_folder(self, folder_id: str):
             assert folder_id == "clips_root"
-            return []
+            return [{"id": "fold_old", "name": "old-collection-1", "mimeType": "application/vnd.google-apps.folder"}]
 
-    cfg = {
-        "V Collection 2": "TRUE",
-        "V Collection 2 Folder ID": "1abcdefghijklmnopqrstuv",
-    }
-    out = compiler.resolve_collection_folder_ids(cfg, drive_client=_Drive(), root_folder_id="clips_root")
-    assert out == [{"collection_num": "2", "folder_id": "1abcdefghijklmnopqrstuv"}]
+    with pytest.raises(RuntimeError, match=r"collection-<number>"):
+        compiler.resolve_collection_folder_ids({}, drive_client=_Drive(), root_folder_id="clips_root")
+
+
+def test_resolve_collection_folder_ids_raises_on_duplicate_collection_numbers() -> None:
+    class _Drive:
+        def list_files_in_folder(self, folder_id: str):
+            assert folder_id == "clips_root"
+            return [
+                {"id": "fold_2a", "name": "collection-2", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "fold_2b", "name": "Collection-2", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "fold_8", "name": "collection-8", "mimeType": "application/vnd.google-apps.folder"},
+            ]
+
+    with pytest.raises(RuntimeError, match=r"Duplicate collection folder numbers"):
+        compiler.resolve_collection_folder_ids({}, drive_client=_Drive(), root_folder_id="clips_root")

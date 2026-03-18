@@ -43,6 +43,14 @@ def test_resolve_pipeline_v1_input_ids_manifest_wins_and_job_is_fallback() -> No
     assert resolved["clips"] == [{"drive_file_id": "clip1", "label": "c1", "category": "P"}]
 
 
+def test_resolve_pipeline_v1_input_ids_preserves_collection_num() -> None:
+    resolved = render_agent.resolve_pipeline_v1_input_ids(
+        {"inputs": {"clips": [{"drive_file_id": "clip3", "collection_num": "collection-8"}]}},
+        {},
+    )
+    assert resolved["clips"] == [{"drive_file_id": "clip3", "label": "clip_001", "collection_num": "8"}]
+
+
 def test_resolve_pipeline_v1_input_ids_uses_job_fallback_when_manifest_missing() -> None:
     resolved = render_agent.resolve_pipeline_v1_input_ids(
         {"inputs": {"clips": [{"drive_file_id": "clip2"}]}},
@@ -55,3 +63,18 @@ def test_resolve_pipeline_v1_input_ids_uses_job_fallback_when_manifest_missing()
     assert resolved["audio_drive_file_id"] == "audio_job"
     assert resolved["lyrics_srt_drive_file_id"] == "lyrics_job"
     assert resolved["copy_srt_drive_file_id"] == "copy_job"
+
+
+def test_resolve_song_title_overlay_prefers_manifest() -> None:
+    manifest = {"text": {"song_title": {"enabled": True, "text": "Manifest Song"}}}
+    job = {"display_song_name": "FALSE", "song_name": "Job Song"}
+    out = render_agent.resolve_song_title_overlay(manifest, job)
+    assert out == {"enabled": True, "text": "Manifest Song"}
+
+
+def test_resolve_song_title_overlay_can_fallback_to_job_fields() -> None:
+    out = render_agent.resolve_song_title_overlay(
+        {"text": {}},
+        {"display_song_name": "TRUE", "song_name": "Job Song"},
+    )
+    assert out == {"enabled": True, "text": "Job Song"}

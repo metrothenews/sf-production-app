@@ -6,7 +6,7 @@ REPO_DIR := $(CURDIR)
 COMPOSE ?= docker compose
 COMPOSE_PROD := $(COMPOSE) -f docker-compose.prod.yml
 
-.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm vm-bootstrap
+.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch run-batch-preflight docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm vm-bootstrap
 
 venv:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -83,7 +83,7 @@ compile-config:
 	@set -euo pipefail; \
 	export CONFIG_SHEET_ID="$${CONFIG_SHEET_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export CONFIG_TAB="$${CONFIG_TAB:-Sheet1}"; \
-	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:AZ2}"; \
+	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:ZZ2}"; \
 	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export OUTPUT_PARENT_FOLDER_ID="$${OUTPUT_PARENT_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export PYTHONPATH=src; \
@@ -101,12 +101,19 @@ run-batch:
 	@set -euo pipefail; \
 	export CONFIG_SHEET_ID="$${CONFIG_SHEET_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export CONFIG_TAB="$${CONFIG_TAB:-Sheet1}"; \
-	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:AZ2}"; \
+	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:ZZ2}"; \
 	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export OUTPUT_PARENT_FOLDER_ID="$${OUTPUT_PARENT_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export SHEETS_JSON_BASE_URL="$${SHEETS_JSON_BASE_URL:-$(BASE_URL_DEFAULT)}"; \
 	export PYTHONPATH=src; \
 	.venv_local/bin/python scripts/trigger_render_batch.py
+
+run-batch-preflight:
+	@if [ -z "$$CONTROL_SHEET_ID" ]; then echo "ERROR: CONTROL_SHEET_ID is required."; exit 1; fi
+	@set -euo pipefail; \
+	export SHEETS_JSON_BASE_URL="$${SHEETS_JSON_BASE_URL:-$(BASE_URL_DEFAULT)}"; \
+	export PYTHONPATH=src; \
+	.venv_local/bin/python scripts/trigger_render_batch.py --preflight-only
 
 docker-build:
 	@$(COMPOSE) build app

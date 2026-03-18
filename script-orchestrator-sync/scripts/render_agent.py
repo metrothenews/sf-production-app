@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -40,6 +41,7 @@ from so_sync.render_repo import (  # noqa: E402
     read_render_jobs_all,
     upsert_render_run,
 )
+from render_obs.events import RenderEventLogger  # noqa: E402
 
 DEFAULT_BASE = "https://YOUR-SHEETS-JSON-GATEWAY.a.run.app"
 WORKSPACE_ROOT = REPO_ROOT.parent
@@ -51,7 +53,23 @@ VSE_TEXT_SCRIPT_PATH = os.environ.get("VSE_TEXT_SCRIPT_PATH", "").strip() or str
 VSE_STITCHER_SCRIPT_PATH = os.environ.get("VSE_STITCHER_SCRIPT_PATH", "").strip() or str(
     (WORKSPACE_ROOT / "vse-stitcher" / "scripts" / "vse_bpm_preset_deterministic_bl456.py").resolve()
 )
+VSE_EFFECTS_SCRIPT_PATH = os.environ.get("VSE_EFFECTS_SCRIPT_PATH", "").strip() or str(
+    (WORKSPACE_ROOT / "vse-stitcher" / "scripts" / "vse_effects_pass_deterministic_bl456.py").resolve()
+)
 DEFAULT_FFMPEG_BIN = "ffmpeg"
+DEFAULT_STAGE_HEARTBEAT_SECONDS = 20.0
+
+_EVENT_LOGGER: RenderEventLogger | None = None
+_EVENT_RUN_ID = ""
+_EVENT_RENDER_JOB_ID = ""
+_EVENT_SUMMARY: dict[str, Any] = {
+    "stages_started": 0,
+    "stages_succeeded": 0,
+    "stages_failed": 0,
+    "stage_retries": 0,
+    "cuts_attempted": 0,
+    "cuts_succeeded": 0,
+}
 
 
 def _must_env(name: str) -> str:
@@ -77,6 +95,141 @@ def _to_float(raw: Any, fallback: float) -> float:
         return float(str(raw).strip())
     except Exception:
         return fallback
+
+
+def _to_bool(raw: Any) -> bool:
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _pipeline_observability_mode() -> str:
+    mode = str(os.environ.get("PIPELINE_OBSERVABILITY_MODE", "deep") or "deep").strip().lower()
+    return mode if mode in {"basic", "deep"} else "deep"
+
+
+def _pipeline_json_events_enabled() -> bool:
+    if _pipeline_observability_mode() == "basic":
+        return False
+    return str(os.environ.get("PIPELINE_JSON_EVENTS_ENABLED", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_stage_heartbeat_seconds() -> float:
+    return max(0.0, _to_float(os.environ.get("PIPELINE_STAGE_HEARTBEAT_SECONDS", str(DEFAULT_STAGE_HEARTBEAT_SECONDS)), DEFAULT_STAGE_HEARTBEAT_SECONDS))
+
+
+def _pipeline_stage_timeout_seconds() -> float:
+    return max(0.0, _to_float(os.environ.get("PIPELINE_STAGE_TIMEOUT_SECONDS", "0"), 0.0))
+
+
+def _pipeline_forensics_on_failure() -> bool:
+    if _pipeline_observability_mode() == "basic":
+        return False
+    return str(os.environ.get("PIPELINE_FORENSICS_ON_FAILURE", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_forensics_upload_enabled() -> bool:
+    return str(os.environ.get("PIPELINE_FORENSICS_UPLOAD", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_forensics_frame_samples() -> int:
+    return max(1, _to_int(os.environ.get("PIPELINE_FORENSICS_FRAME_SAMPLES", "12"), 12))
+
+
+def _classify_error_code(message: str) -> str:
+    text = str(message or "").lower()
+    if "overlap detected" in text or "stutter segment overlap" in text:
+        return "E_STITCH_OVERLAP"
+    if "effects strip window mismatch" in text:
+        return "E_EFFECTS_WINDOW"
+    if "base_video_too_short" in text:
+        return "E_EFFECTS_BASE_SHORT"
+    if "duration gate failed" in text or "frame gate failed" in text or "output duration gate failed" in text:
+        return "E_OUTPUT_SHORT"
+    if "timeout" in text and "stage=" in text:
+        return "E_STAGE_TIMEOUT"
+    if "confirm_upload_size" in text or "size mismatch" in text:
+        return "E_UPLOAD_VERIFY"
+    if "ssl" in text or "timed out" in text or "connection reset" in text or "transport" in text:
+        return "E_UPLOAD_TRANSPORT"
+    if "append_outputs_index_rows" in text or "outputs_index_append" in text:
+        return "E_SHEETS_APPEND"
+    return "E_UNKNOWN"
+
+
+def _event_log_path_default(run_id: str) -> str:
+    logs_dir = Path(tempfile.gettempdir()) / "so_render_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return str(logs_dir / f"{run_id}.events.jsonl")
+
+
+def _init_event_logger(*, run_id: str, render_job_id: str, path: str = "") -> None:
+    global _EVENT_LOGGER, _EVENT_RUN_ID, _EVENT_RENDER_JOB_ID, _EVENT_SUMMARY
+    _EVENT_RUN_ID = str(run_id or "")
+    _EVENT_RENDER_JOB_ID = str(render_job_id or "")
+    _EVENT_SUMMARY = {
+        "stages_started": 0,
+        "stages_succeeded": 0,
+        "stages_failed": 0,
+        "stage_retries": 0,
+        "cuts_attempted": 0,
+        "cuts_succeeded": 0,
+    }
+    out_path = str(path or _event_log_path_default(_EVENT_RUN_ID))
+    _EVENT_LOGGER = RenderEventLogger(out_path, enabled=_pipeline_json_events_enabled())
+
+
+def _rebind_event_logger(path: str) -> None:
+    global _EVENT_LOGGER
+    if _EVENT_LOGGER is None:
+        return
+    _EVENT_LOGGER.rebind(path)
+
+
+def _event_log_path() -> str:
+    if _EVENT_LOGGER is None:
+        return ""
+    return str(_EVENT_LOGGER.path)
+
+
+def _emit_event(
+    *,
+    event: str,
+    stage: str = "",
+    cut_idx: int = 0,
+    attempt: int = 0,
+    severity: str = "info",
+    code: str = "",
+    message: str = "",
+    **extra: Any,
+) -> None:
+    if _EVENT_LOGGER is None:
+        return
+    _EVENT_LOGGER.emit(
+        run_id=_EVENT_RUN_ID,
+        render_job_id=_EVENT_RENDER_JOB_ID,
+        cut_idx=int(cut_idx or 0),
+        stage=str(stage or ""),
+        attempt=int(attempt or 0),
+        event=str(event or ""),
+        severity=str(severity or "info"),
+        code=str(code or ""),
+        message=str(message or ""),
+        **extra,
+    )
 
 
 def _debug_job(job: Dict[str, Any]) -> None:
@@ -162,6 +315,16 @@ def _normalize_category_key(value: Any) -> str:
     return ""
 
 
+def _normalize_collection_num(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(\d+)", raw)
+    if not m:
+        return ""
+    return str(int(m.group(1)))
+
+
 def build_pipeline_workdir_paths(run_id: str, *, base_tmp_dir: str | None = None) -> dict[str, str]:
     root = Path(base_tmp_dir or tempfile.gettempdir()) / "so_work" / run_id
     return {
@@ -199,6 +362,9 @@ def resolve_pipeline_v1_input_ids(manifest: dict[str, Any], job: dict[str, Any])
             category = _normalize_category_key(raw.get("category") or raw.get("cat") or "")
             if category:
                 clip_row["category"] = category
+            collection_num = _normalize_collection_num(raw.get("collection_num"))
+            if collection_num:
+                clip_row["collection_num"] = collection_num
             clips.append(clip_row)
     audio_id = str(inputs.get("audio_drive_file_id") or job.get("audio_drive_file_id") or "").strip()
     lyrics_id = str(inputs.get("lyrics_srt_drive_file_id") or job.get("srt_drive_file_id") or "").strip()
@@ -220,6 +386,20 @@ def plan_pipeline_v1_stages(manifest: dict[str, Any], resolved_inputs: dict[str,
     return stages
 
 
+def resolve_song_title_overlay(manifest: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    text_cfg = manifest.get("text", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(text_cfg, dict):
+        text_cfg = {}
+    song_cfg = text_cfg.get("song_title", {})
+    if not isinstance(song_cfg, dict):
+        song_cfg = {}
+    enabled = _to_bool(song_cfg.get("enabled")) or _to_bool(job.get("display_song_name"))
+    text = str(song_cfg.get("text") or job.get("song_name") or "").strip()
+    if not enabled or not text:
+        return {"enabled": False, "text": ""}
+    return {"enabled": True, "text": text}
+
+
 def _safe_link_or_copy(src: str, dst: str) -> None:
     src_path = Path(src)
     dst_path = Path(dst)
@@ -235,12 +415,27 @@ def _safe_link_or_copy(src: str, dst: str) -> None:
 def _extract_stitch_categories(stitch_preset: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
-    for m in re.finditer(r"\d+([A-Za-z])", str(stitch_preset or "")):
-        cat = str(m.group(1) or "").upper()
-        if not cat or not cat.isalpha() or cat in seen:
+    s = str(stitch_preset or "").strip()
+    i = 0
+    while i < len(s):
+        if not s[i].isdigit():
+            i += 1
             continue
-        seen.add(cat)
-        out.append(cat)
+        j = i
+        while j < len(s) and s[j].isdigit():
+            j += 1
+        k = j
+        while k < len(s) and s[k].isalpha():
+            k += 1
+        if k == j:
+            i = j + 1
+            continue
+        suffix = s[j:k]
+        cat = suffix[-1].upper()
+        if cat and cat.isalpha() and cat not in seen:
+            seen.add(cat)
+            out.append(cat)
+        i = k
     return out
 
 
@@ -471,7 +666,34 @@ def _allow_empty_lyrics_srt() -> bool:
 
 
 def _pipeline_per_cut_render_enabled() -> bool:
-    return os.environ.get("PIPELINE_PER_CUT_RENDER", "0").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get("PIPELINE_PER_CUT_RENDER", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _pipeline_effects_pass2_enabled() -> bool:
+    return os.environ.get("PIPELINE_EFFECTS_PASS2_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_effects_pass2_strict() -> bool:
+    return os.environ.get("PIPELINE_EFFECTS_PASS2_STRICT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_effects_keep_plan_on_success() -> bool:
+    return os.environ.get("PIPELINE_EFFECTS_PASS2_KEEP_PLAN_ON_SUCCESS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _count_srt_cues(path: str) -> int:
@@ -503,6 +725,18 @@ def _require_nonempty_srt(path: str, *, label: str) -> int:
         f"{label} has zero subtitle cues at {path}. "
         "Set ALLOW_EMPTY_LYRICS_SRT=1 to bypass this guardrail."
     )
+
+
+def _assert_file_exists(path: str, *, label: str) -> None:
+    p = Path(str(path or "").strip())
+    if not p.exists() or not p.is_file():
+        raise RuntimeError(f"{label} missing file: {p}")
+
+
+def _assert_dir_exists(path: str, *, label: str) -> None:
+    p = Path(str(path or "").strip())
+    if not p.exists() or not p.is_dir():
+        raise RuntimeError(f"{label} missing directory: {p}")
 
 
 def _should_fallback_to_legacy_full_render(*, main_lyrics_cues: int, cuts_with_lyrics: int) -> bool:
@@ -544,6 +778,165 @@ def _probe_media_duration_seconds(path: str) -> float:
     return duration
 
 
+def _probe_media_video_frame_count(path: str) -> int:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return 0
+    raw = str(proc.stdout or "").strip().splitlines()
+    if not raw:
+        return 0
+    try:
+        return int(raw[-1].strip())
+    except Exception:
+        return 0
+
+
+def _probe_media_summary(path: str) -> dict[str, Any]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,width,height,nb_frames:format=duration",
+        "-of",
+        "json",
+        path,
+    ]
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {
+            "path": path,
+            "duration_s": 0.0,
+            "video_frames": 0,
+            "resolution": "",
+            "audio_stream_present": False,
+            "probe_error": str(proc.stderr or "").strip(),
+        }
+    try:
+        payload = json.loads(str(proc.stdout or "{}"))
+    except Exception:
+        payload = {}
+    streams = list(payload.get("streams") or [])
+    fmt = dict(payload.get("format") or {})
+    duration_s = _to_float(fmt.get("duration"), 0.0)
+    video_frames = 0
+    resolution = ""
+    audio_present = False
+    for stream in streams:
+        if str(stream.get("codec_type") or "") == "audio":
+            audio_present = True
+        if str(stream.get("codec_type") or "") == "video":
+            width = _to_int(stream.get("width"), 0)
+            height = _to_int(stream.get("height"), 0)
+            if width > 0 and height > 0:
+                resolution = f"{width}x{height}"
+            video_frames = max(video_frames, _to_int(stream.get("nb_frames"), 0))
+    return {
+        "path": path,
+        "duration_s": duration_s,
+        "video_frames": video_frames,
+        "resolution": resolution,
+        "audio_stream_present": audio_present,
+    }
+
+
+def _emit_media_summary_event(*, path: str, stage: str, cut_idx: int) -> None:
+    summary = _probe_media_summary(path)
+    _emit_event(
+        event="media_summary",
+        stage=stage,
+        cut_idx=cut_idx,
+        message="ffprobe summary",
+        **summary,
+    )
+
+
+def _assert_expected_cut_output(
+    *,
+    output_path: str,
+    expected_duration_s: float,
+    expected_frames: int,
+    duration_tolerance_s: float = 0.20,
+    frame_tolerance: int = 2,
+    stage: str = "output_gate",
+    cut_idx: int = 0,
+) -> None:
+    actual_duration_s = _probe_media_duration_seconds(output_path)
+    actual_frames = _probe_media_video_frame_count(output_path)
+    _emit_event(
+        event="output_probe",
+        stage=stage,
+        cut_idx=cut_idx,
+        message="output probe summary",
+        file=output_path,
+        expected_s=float(expected_duration_s),
+        actual_s=float(actual_duration_s),
+        expected_frames=int(expected_frames),
+        actual_frames=int(actual_frames),
+        tolerance_s=float(duration_tolerance_s),
+        tolerance_frames=int(frame_tolerance),
+    )
+    if actual_duration_s + float(duration_tolerance_s) < float(expected_duration_s):
+        _emit_event(
+            event="output_gate_fail",
+            stage=stage,
+            cut_idx=cut_idx,
+            severity="error",
+            code="E_OUTPUT_SHORT",
+            message="duration gate failed",
+            file=output_path,
+            expected_s=float(expected_duration_s),
+            actual_s=float(actual_duration_s),
+            tolerance_s=float(duration_tolerance_s),
+        )
+        raise RuntimeError(
+            "pipeline_v1 effects output duration gate failed "
+            f"expected_s={expected_duration_s:.3f} actual_s={actual_duration_s:.3f} "
+            f"tolerance_s={float(duration_tolerance_s):.3f} output={output_path}"
+        )
+    if actual_frames > 0 and actual_frames + int(frame_tolerance) < int(expected_frames):
+        _emit_event(
+            event="output_gate_fail",
+            stage=stage,
+            cut_idx=cut_idx,
+            severity="error",
+            code="E_OUTPUT_SHORT",
+            message="frame gate failed",
+            file=output_path,
+            expected_frames=int(expected_frames),
+            actual_frames=int(actual_frames),
+            tolerance_frames=int(frame_tolerance),
+        )
+        raise RuntimeError(
+            "pipeline_v1 effects output frame gate failed "
+            f"expected_frames={int(expected_frames)} actual_frames={int(actual_frames)} "
+            f"tolerance_frames={int(frame_tolerance)} output={output_path}"
+        )
+    _emit_event(
+        event="output_gate_pass",
+        stage=stage,
+        cut_idx=cut_idx,
+        message="output gate passed",
+        file=output_path,
+        expected_s=float(expected_duration_s),
+        actual_s=float(actual_duration_s),
+        expected_frames=int(expected_frames),
+        actual_frames=int(actual_frames),
+    )
+
+
 def _log_tail_excerpt(log_path: str, *, max_lines: int = 25, max_chars: int = 1200) -> str:
     try:
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
@@ -554,6 +947,20 @@ def _log_tail_excerpt(log_path: str, *, max_lines: int = 25, max_chars: int = 12
     if len(snippet) > max(80, int(max_chars)):
         snippet = snippet[-max_chars:]
     return snippet
+
+
+def _extract_reveal_auto_speed_baseline_from_log(log_path: str) -> float:
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0.0
+    pattern = re.compile(r"reveal_auto_speed_baseline .*?baseline_wps=([0-9]*\.?[0-9]+)")
+    for line in reversed(text.splitlines()):
+        m = pattern.search(line)
+        if not m:
+            continue
+        return _to_float(m.group(1), 0.0)
+    return 0.0
 
 
 def _materialize_expected_video_output(
@@ -720,6 +1127,22 @@ def _is_pipeline_final_video_artifact(
     return normalized == "pipeline_final_mp4" and str(run_id or "").strip() not in run_ids_with_shorts
 
 
+def _is_pipeline_drive_upload_artifact(
+    *,
+    artifact_type: str,
+    run_id: str,
+    run_ids_with_shorts: set[str],
+) -> bool:
+    normalized = str(artifact_type or "").strip().lower()
+    if _is_pipeline_final_video_artifact(
+        artifact_type=normalized,
+        run_id=run_id,
+        run_ids_with_shorts=run_ids_with_shorts,
+    ):
+        return True
+    return normalized in {"pipeline_events_jsonl", "pipeline_diag_bundle", "pipeline_diag_summary_json"}
+
+
 def _collect_pipeline_cleanup_drive_file_ids(
     rows: list[dict[str, Any]],
     *,
@@ -791,6 +1214,13 @@ def build_vse_text_command(job: dict, *, blender_bin: str, script_path: str) -> 
     render_end_seconds = _to_float(job.get("render_end_seconds", ""), 0.0)
     if render_end_seconds > 0.0:
         cmd.extend(["--render-end-seconds", f"{render_end_seconds:.3f}"])
+    auto_baseline_wps = _to_float(job.get("auto_baseline_wps", ""), 0.0)
+    if auto_baseline_wps > 0.0:
+        cmd.extend(["--auto-baseline-wps", f"{auto_baseline_wps:.6f}"])
+    if _to_bool(job.get("display_song_name")):
+        song_name = str(job.get("song_name") or "").strip()
+        if song_name:
+            cmd.extend(["--song-title", song_name])
     return cmd
 
 
@@ -868,6 +1298,43 @@ def build_vse_stitcher_command(job: dict, *, blender_bin: str, script_path: str)
         str(job["stitch_preset"]).strip(),
         "--seed",
         str(job["seed"]).strip(),
+        "--output",
+        str(job["output_local_path"]).strip(),
+    ]
+    render_end_seconds = _to_float(job.get("render_end_seconds", ""), 0.0)
+    if render_end_seconds > 0.0:
+        cmd.extend(["--render-end-seconds", f"{render_end_seconds:.3f}"])
+    effects_pass1_mode = str(job.get("effects_pass1_mode") or "").strip()
+    if effects_pass1_mode:
+        cmd.extend(["--effects-pass1-mode", effects_pass1_mode])
+    effects_plan_out = str(job.get("effects_plan_out") or "").strip()
+    if effects_plan_out:
+        cmd.extend(["--effects-plan-out", effects_plan_out])
+    run_id = str(job.get("run_id") or "").strip()
+    if run_id:
+        cmd.extend(["--run-id", run_id])
+    if str(job.get("cut_idx") or "").strip():
+        cmd.extend(["--cut-idx", str(job.get("cut_idx")).strip()])
+    return cmd
+
+
+def build_vse_effects_command(job: dict, *, blender_bin: str, script_path: str) -> list[str]:
+    cmd = [
+        blender_bin,
+        "-b",
+        "--python",
+        script_path,
+        "--",
+        "--input-video",
+        str(job["input_video_path"]).strip(),
+        "--audio",
+        str(job["input_audio_path"]).strip(),
+        "--effects-plan",
+        str(job["effects_plan_path"]).strip(),
+        "--fps",
+        str(job["fps"]).strip(),
+        "--aspect",
+        str(job["aspect"]).strip(),
         "--output",
         str(job["output_local_path"]).strip(),
     ]
@@ -972,32 +1439,423 @@ def _guess_mime_type(path: str) -> str:
     return "application/octet-stream"
 
 
+def _pipeline_upload_verify_mode() -> str:
+    return str(os.environ.get("PIPELINE_UPLOAD_VERIFY_MODE", "size") or "size").strip().lower()
+
+
+def _pipeline_cleanup_on_success_enabled() -> bool:
+    return str(os.environ.get("PIPELINE_LOCAL_CLEANUP_ON_SUCCESS", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _pipeline_cleanup_on_failure_mode() -> str:
+    return str(os.environ.get("PIPELINE_LOCAL_CLEANUP_ON_FAILURE", "logs_only") or "logs_only").strip().lower()
+
+
+def _local_path_from_artifact_row(row: dict[str, Any]) -> str:
+    return str(row.get("notes") or "").replace("local_path=", "", 1).strip()
+
+
+def _delete_local_file_best_effort(path: str) -> None:
+    raw = str(path or "").strip()
+    if not raw:
+        return
+    p = Path(raw)
+    try:
+        if p.is_file() or p.is_symlink():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception as exc:
+        print(f"local_cleanup_skip path={raw} error={exc}")
+
+
+def _prune_run_tree_keep_logs(root_dir: str, logs_dir: str, *, preserve_dirs: list[str] | None = None) -> None:
+    root = Path(str(root_dir or "").strip())
+    logs = Path(str(logs_dir or "").strip())
+    if not root.exists():
+        return
+    logs_resolved = logs.resolve() if logs.exists() else None
+    preserved = set()
+    for raw in list(preserve_dirs or []):
+        p = Path(str(raw or "").strip())
+        if p.exists():
+            preserved.add(p.resolve())
+    for child in root.iterdir():
+        if logs_resolved and child.resolve() == logs_resolved:
+            continue
+        if child.resolve() in preserved:
+            continue
+        _delete_local_file_best_effort(str(child))
+
+
+def _cleanup_pipeline_local_artifacts(paths: dict[str, str], *, success: bool) -> None:
+    root = str(paths.get("root") or "").strip()
+    logs = str(paths.get("logs") or "").strip()
+    diagnostics = str(paths.get("diagnostics") or "").strip()
+    if not root:
+        return
+    if success:
+        if not _pipeline_cleanup_on_success_enabled():
+            return
+        _delete_local_file_best_effort(root)
+        return
+
+    mode = _pipeline_cleanup_on_failure_mode()
+    if mode in {"none", "off", "false", "0"}:
+        return
+    if mode == "logs_only":
+        preserve = [diagnostics] if diagnostics else []
+        _prune_run_tree_keep_logs(root, logs, preserve_dirs=preserve)
+        return
+    _delete_local_file_best_effort(root)
+
+
+def _upload_confirm_record_and_delete(
+    *,
+    gw: SheetsGateway,
+    control_sheet_id: str,
+    client: Any,
+    artifact_row: dict[str, Any],
+    drive_folder_id: str,
+    verify_mode: str,
+) -> dict[str, Any]:
+    row = dict(artifact_row)
+    local_path = _local_path_from_artifact_row(row)
+    if not local_path:
+        raise RuntimeError(f"artifact row missing local path: artifact_type={row.get('artifact_type')}")
+    mime_type = _guess_mime_type(local_path)
+    artifact_type = str(row.get("artifact_type") or "")
+    _emit_event(
+        event="upload_start",
+        stage="upload",
+        message="artifact upload start",
+        artifact_type=artifact_type,
+        file=local_path,
+        mime_type=mime_type,
+    )
+    try:
+        drive_file_id = client.upload_file(local_path, drive_folder_id, mime_type)
+    except Exception as exc:
+        _emit_event(
+            event="upload_fail",
+            stage="upload",
+            severity="error",
+            code=_classify_error_code(str(exc)),
+            message="artifact upload failed",
+            artifact_type=artifact_type,
+            file=local_path,
+            exception=str(exc),
+        )
+        raise
+
+    if verify_mode != "size":
+        raise RuntimeError(f"Unsupported PIPELINE_UPLOAD_VERIFY_MODE: {verify_mode}")
+    expected_bytes = _to_int(row.get("bytes"), 0)
+    try:
+        client.confirm_upload_size(drive_file_id, expected_bytes)
+    except Exception as exc:
+        _emit_event(
+            event="upload_fail",
+            stage="upload",
+            severity="error",
+            code="E_UPLOAD_VERIFY",
+            message="artifact upload verification failed",
+            artifact_type=artifact_type,
+            file=local_path,
+            drive_file_id=drive_file_id,
+            expected_bytes=int(expected_bytes),
+            exception=str(exc),
+        )
+        raise
+
+    row["drive_file_id"] = drive_file_id
+    row["drive_folder_id"] = drive_folder_id
+    try:
+        append_outputs_index_rows(gw, control_sheet_id, [row])
+    except Exception:
+        _delete_drive_file_best_effort(
+            client,
+            drive_file_id=drive_file_id,
+            reason=(
+                f"rollback_failed_outputs_index_append run_id={row.get('run_id')} "
+                f"artifact_type={row.get('artifact_type')}"
+            ),
+        )
+        _emit_event(
+            event="upload_fail",
+            stage="upload",
+            severity="error",
+            code="E_SHEETS_APPEND",
+            message="outputs index append failed after upload",
+            artifact_type=artifact_type,
+            file=local_path,
+            drive_file_id=drive_file_id,
+        )
+        raise
+
+    _delete_local_file_best_effort(local_path)
+    _emit_event(
+        event="upload_end",
+        stage="upload",
+        message="artifact upload complete",
+        artifact_type=artifact_type,
+        file=local_path,
+        drive_file_id=drive_file_id,
+        bytes=int(expected_bytes),
+    )
+    return row
+
+
 def _run_to_log(
     cmd: list[str],
     log_path: str,
     *,
     stage: str,
+    cut_idx: int = 0,
     retries: int = 0,
     retry_delay_seconds: float = 1.0,
+    output_probe_path: str = "",
 ) -> None:
     attempts = max(1, int(retries) + 1)
     delay = max(0.0, float(retry_delay_seconds))
+    heartbeat_s = _pipeline_stage_heartbeat_seconds()
+    timeout_s = _pipeline_stage_timeout_seconds()
     log_file = Path(log_path)
     for attempt in range(1, attempts + 1):
         mode = "wb" if attempt == 1 else "ab"
+        _EVENT_SUMMARY["stages_started"] = int(_EVENT_SUMMARY.get("stages_started", 0)) + 1
+        cmd_text = shlex.join([str(x) for x in cmd])
+        _emit_event(
+            event="stage_start",
+            stage=stage,
+            cut_idx=cut_idx,
+            attempt=attempt,
+            message="stage subprocess start",
+            cmd=cmd_text,
+            log_path=str(log_file),
+            timeout_s=float(timeout_s),
+            heartbeat_s=float(heartbeat_s),
+        )
         with log_file.open(mode) as log_f:
             if attempt > 1:
                 log_f.write(f"\n--- retry attempt {attempt}/{attempts} stage={stage} ---\n".encode("utf-8"))
-            proc = subprocess.run(cmd, stdout=log_f, stderr=subprocess.STDOUT, check=False)
-        if proc.returncode == 0:
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            started = time.monotonic()
+            next_heartbeat = started + max(1.0, heartbeat_s) if heartbeat_s > 0 else 0.0
+            timed_out = False
+            while True:
+                rc = proc.poll()
+                now = time.monotonic()
+                elapsed = now - started
+                if rc is not None:
+                    break
+                if timeout_s > 0 and elapsed >= timeout_s:
+                    timed_out = True
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc.wait(timeout=5)
+                    _EVENT_SUMMARY["stages_failed"] = int(_EVENT_SUMMARY.get("stages_failed", 0)) + 1
+                    _emit_event(
+                        event="stage_fail",
+                        stage=stage,
+                        cut_idx=cut_idx,
+                        attempt=attempt,
+                        severity="error",
+                        code="E_STAGE_TIMEOUT",
+                        message="stage timeout exceeded",
+                        duration_ms=int(round(elapsed * 1000.0)),
+                        timeout_s=float(timeout_s),
+                        cmd=cmd_text,
+                        log_path=str(log_file),
+                    )
+                    raise RuntimeError(
+                        f"stage={stage} timed out after {timeout_s:.1f}s attempt={attempt}/{attempts} log_path={log_path}"
+                    )
+                if heartbeat_s > 0 and now >= next_heartbeat:
+                    probe_bytes = 0
+                    if output_probe_path:
+                        try:
+                            probe_bytes = int(Path(output_probe_path).stat().st_size)
+                        except Exception:
+                            probe_bytes = 0
+                    _emit_event(
+                        event="stage_heartbeat",
+                        stage=stage,
+                        cut_idx=cut_idx,
+                        attempt=attempt,
+                        message="stage still running",
+                        duration_ms=int(round(elapsed * 1000.0)),
+                        output_probe_path=output_probe_path or "",
+                        output_probe_bytes=probe_bytes,
+                        log_bytes=int(log_file.stat().st_size) if log_file.exists() else 0,
+                    )
+                    next_heartbeat = now + max(1.0, heartbeat_s)
+                time.sleep(0.25)
+            if timed_out:
+                continue
+            return_code = int(proc.returncode or 0)
+        elapsed_ms = int(round((time.monotonic() - started) * 1000.0))
+        if return_code == 0:
+            _EVENT_SUMMARY["stages_succeeded"] = int(_EVENT_SUMMARY.get("stages_succeeded", 0)) + 1
+            _emit_event(
+                event="stage_end",
+                stage=stage,
+                cut_idx=cut_idx,
+                attempt=attempt,
+                message="stage subprocess completed",
+                duration_ms=elapsed_ms,
+                log_path=str(log_file),
+                output_probe_path=output_probe_path or "",
+            )
             return
+        _EVENT_SUMMARY["stages_failed"] = int(_EVENT_SUMMARY.get("stages_failed", 0)) + 1
         if attempt < attempts:
+            _EVENT_SUMMARY["stage_retries"] = int(_EVENT_SUMMARY.get("stage_retries", 0)) + 1
+            _emit_event(
+                event="stage_retry",
+                stage=stage,
+                cut_idx=cut_idx,
+                attempt=attempt,
+                severity="warning",
+                code=_classify_error_code(f"stage={stage} exit_code={return_code}"),
+                message="stage failed, retry scheduled",
+                exit_code=return_code,
+                duration_ms=elapsed_ms,
+                retry_in_s=float(delay),
+                log_path=str(log_file),
+            )
             time.sleep(delay)
             continue
         tail = _log_tail_excerpt(log_path).replace("\n", " | ")
-        raise RuntimeError(
-            f"stage={stage} failed exit_code={proc.returncode} attempts={attempts} log_path={log_path} log_tail={tail}"
+        code = _classify_error_code(tail)
+        _emit_event(
+            event="stage_fail",
+            stage=stage,
+            cut_idx=cut_idx,
+            attempt=attempt,
+            severity="error",
+            code=code,
+            message="stage failed after retries",
+            exit_code=return_code,
+            duration_ms=elapsed_ms,
+            log_path=str(log_file),
+            log_tail=tail,
         )
+        raise RuntimeError(
+            f"stage={stage} failed exit_code={return_code} attempts={attempts} log_path={log_path} log_tail={tail}"
+        )
+
+
+def _build_forensics_bundle(
+    *,
+    run_id: str,
+    render_job_id: str,
+    run_root: str,
+    error_message: str,
+) -> tuple[str, str]:
+    script = REPO_ROOT / "scripts" / "render_forensics_bundle.py"
+    if not script.exists():
+        return "", ""
+    out_dir = Path(run_root) / "diagnostics" / run_id
+    cmd = [
+        sys.executable,
+        str(script),
+        "--run-dir",
+        str(run_root),
+        "--run-id",
+        str(run_id),
+        "--render-job-id",
+        str(render_job_id),
+        "--error",
+        str(error_message or ""),
+        "--output-dir",
+        str(out_dir),
+        "--frame-samples",
+        str(_pipeline_forensics_frame_samples()),
+    ]
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=str(REPO_ROOT))
+    if proc.returncode != 0:
+        _emit_event(
+            event="forensics_fail",
+            stage="forensics",
+            severity="warning",
+            code="E_UNKNOWN",
+            message="forensics bundle command failed",
+            command=shlex.join(cmd),
+            stderr=str(proc.stderr or "").strip(),
+        )
+        return "", ""
+    summary_path = str(out_dir / "summary.json")
+    bundle_path = str(out_dir / "bundle.zip")
+    _emit_event(
+        event="forensics_done",
+        stage="forensics",
+        message="forensics bundle generated",
+        summary_path=summary_path,
+        bundle_path=bundle_path,
+    )
+    return summary_path if Path(summary_path).exists() else "", bundle_path if Path(bundle_path).exists() else ""
+
+
+def _upload_failure_diagnostics(
+    *,
+    gw: SheetsGateway,
+    control_sheet_id: str,
+    client: Any | None,
+    drive_folder_id: str,
+    run_id: str,
+    render_job_id: str,
+    campaign_id: str,
+    verify_mode: str,
+    summary_path: str,
+    bundle_path: str,
+) -> int:
+    if client is None or not drive_folder_id:
+        return 0
+    created = _utc_now_iso()
+    rows: list[dict[str, Any]] = []
+    if summary_path and Path(summary_path).exists():
+        rows.append(
+            _build_output_row_from_file(
+                run_id=run_id,
+                render_job_id=render_job_id,
+                campaign_id=campaign_id,
+                artifact_type="pipeline_diag_summary_json",
+                file_path=summary_path,
+                created_utc=created,
+            )
+        )
+    if bundle_path and Path(bundle_path).exists():
+        rows.append(
+            _build_output_row_from_file(
+                run_id=run_id,
+                render_job_id=render_job_id,
+                campaign_id=campaign_id,
+                artifact_type="pipeline_diag_bundle",
+                file_path=bundle_path,
+                created_utc=created,
+            )
+        )
+    written = 0
+    for row in rows:
+        out = _upload_confirm_record_and_delete(
+            gw=gw,
+            control_sheet_id=control_sheet_id,
+            client=client,
+            artifact_row=row,
+            drive_folder_id=drive_folder_id,
+            verify_mode=verify_mode,
+        )
+        if out:
+            written += 1
+    return written
 
 
 def _load_json_file(path: str) -> dict[str, Any]:
@@ -1107,6 +1965,7 @@ def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) ->
         drive_id = str(clip.get("drive_file_id") or "").strip()
         label = str(clip.get("label") or drive_id).strip()
         category = _normalize_category_key(clip.get("category") or "")
+        collection_num = _normalize_collection_num(clip.get("collection_num"))
         if not drive_id:
             continue
         clip_path = str(Path(paths["clips"]) / build_clip_filename(label, drive_id))
@@ -1115,6 +1974,8 @@ def resolve_and_download_pipeline_v1_inputs(job: dict[str, Any], run_id: str) ->
         clip_spec_row = {"path": clip_path, "drive_file_id": drive_id, "label": label}
         if category:
             clip_spec_row["category"] = category
+        if collection_num:
+            clip_spec_row["collection_num"] = collection_num
         clip_specs_out.append(clip_spec_row)
 
     return {
@@ -1190,9 +2051,17 @@ def run_once() -> int:
 
     render_job_id = str(job.get("render_job_id") or "").strip()
     run_id = uuid.uuid4().hex[:32]
+    _init_event_logger(run_id=run_id, render_job_id=render_job_id)
     dedupe_key = f"render:{render_job_id}:{run_id}"
     run_row = _new_render_run(run_id, render_job_id, RENDER_STATUS_QUEUED, now, dedupe_key=dedupe_key)
     upsert_render_run(gw, control_sheet_id, run_row)
+    pipeline_paths_for_cleanup: dict[str, str] | None = None
+    pipeline_run_succeeded = False
+    pipeline_diag_client: Any | None = None
+    pipeline_diag_drive_folder_id = ""
+    pipeline_diag_verify_mode = _pipeline_upload_verify_mode()
+    pipeline_diag_campaign_id = str(job.get("campaign_id") or "")
+    _emit_event(event="run_start", stage="run", message="render run started", renderer=str(job.get("renderer") or "noop"))
 
     try:
         started = _utc_now_iso()
@@ -1203,6 +2072,7 @@ def run_once() -> int:
         upsert_render_run(gw, control_sheet_id, run_row)
 
         renderer = str(job.get("renderer") or "noop").strip().lower()
+        _emit_event(event="renderer_selected", stage="run", message="renderer selected", renderer=renderer)
         if renderer == "noop":
             _maybe_download_drive_inputs(job)
             local_path, num_bytes, digest = _write_noop_artifact_local(render_job_id)
@@ -1319,7 +2189,13 @@ def run_once() -> int:
 
             resolved = resolve_and_download_pipeline_v1_inputs(job, run_id)
             paths = resolved["paths"]
+            events_jsonl = str(Path(paths["logs"]) / "events.jsonl")
+            _rebind_event_logger(events_jsonl)
+            paths["events"] = events_jsonl
+            paths["diagnostics"] = str(Path(paths["root"]) / "diagnostics")
+            pipeline_paths_for_cleanup = dict(paths)
             manifest = resolved["manifest"]
+            song_title_overlay = resolve_song_title_overlay(manifest, job)
             stage_plan = plan_pipeline_v1_stages(manifest, resolved)
             main_lyrics_cues = _require_nonempty_srt(
                 str(resolved["lyrics_srt_path"]),
@@ -1340,6 +2216,36 @@ def run_once() -> int:
             ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip() or DEFAULT_FFMPEG_BIN
             blender_stage_retries = _to_int(os.environ.get("PIPELINE_BLENDER_STAGE_RETRIES", "1"), 1)
             blender_retry_delay_s = float(os.environ.get("PIPELINE_BLENDER_RETRY_DELAY_SECONDS", "1"))
+            output_mode = str(job.get("output_mode") or "local").strip().lower()
+            if output_mode not in {"local", "drive"}:
+                raise RuntimeError(f"Unsupported output_mode: {output_mode}")
+            is_drive_output = output_mode == "drive"
+            verify_mode = _pipeline_upload_verify_mode()
+            artifacts_written = 0
+            drive_folder_id = ""
+            client: Any | None = None
+            existing_rows: list[dict[str, Any]] = []
+            run_ids_with_shorts: set[str] = set()
+            uploaded_short_rows: list[dict[str, Any]] = []
+
+            if is_drive_output:
+                dst_parent = _require_job_field(job, "output_drive_folder_id", renderer=renderer)
+                client = drive_upload_from_env()
+                campaign_id = str(job.get("campaign_id") or "")
+                folder_name = build_pipeline_subfolder_name(campaign_id, run_id)
+                if folder_name:
+                    drive_folder_id = client.find_folder_by_name(folder_name, dst_parent) or client.create_folder(
+                        folder_name, dst_parent
+                    )
+                else:
+                    drive_folder_id = dst_parent
+                existing_rows = read_outputs_index_all(gw, control_sheet_id)
+                run_ids_with_shorts = _pipeline_run_ids_with_shorts(existing_rows)
+                run_ids_with_shorts.add(run_id)
+                pipeline_diag_client = client
+                pipeline_diag_drive_folder_id = drive_folder_id
+                pipeline_diag_campaign_id = campaign_id
+                pipeline_diag_verify_mode = verify_mode
 
             per_cut_render = _pipeline_per_cut_render_enabled()
 
@@ -1390,6 +2296,7 @@ def run_once() -> int:
                     with Path(stitch_log_local).open("a", encoding="utf-8") as lf:
                         lf.write("\n")
                         lf.write("stitch_fallback=copy_first_clip reason=missing_base_output\n")
+                _emit_media_summary_event(path=base_mp4_local, stage="stitch", cut_idx=0)
 
                 lyrics_job = {
                     "input_video_path": base_mp4_local,
@@ -1401,6 +2308,8 @@ def run_once() -> int:
                     "bg_mode": str(job.get("bg_mode") or ""),
                     "output_local_path": lyrics_mp4_local,
                     "render_end_seconds": render_end_seconds,
+                    "display_song_name": song_title_overlay["enabled"],
+                    "song_name": song_title_overlay["text"],
                 }
                 lyrics_cmd = build_vse_text_command(lyrics_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH)
                 _run_to_log(
@@ -1419,6 +2328,7 @@ def run_once() -> int:
                     with Path(lyrics_log_local).open("a", encoding="utf-8") as lf:
                         lf.write("\n")
                         lf.write("lyrics_fallback=copy_base reason=missing_lyrics_output\n")
+                _emit_media_summary_event(path=lyrics_mp4_local, stage="lyrics", cut_idx=0)
 
                 if "copy" in stage_plan:
                     final_mp4_local = str(Path(paths["outputs"]) / "final.mp4")
@@ -1442,6 +2352,8 @@ def run_once() -> int:
                         retries=blender_stage_retries,
                         retry_delay_seconds=blender_retry_delay_s,
                     )
+                    if Path(final_mp4_local).exists():
+                        _emit_media_summary_event(path=final_mp4_local, stage="copy", cut_idx=0)
 
                 # Some preset/script combinations can report success while not materializing lyrics output.
                 # Keep pipeline moving by falling back to stitch output for cut extraction.
@@ -1535,6 +2447,10 @@ def run_once() -> int:
                 media_root_cache: dict[str, str] = {}
                 have_primary = False
                 cuts_with_lyrics = 0
+                shared_auto_baseline_wps = 0.0
+                effects_pass2_enabled = _pipeline_effects_pass2_enabled()
+                effects_pass2_strict = _pipeline_effects_pass2_strict()
+                keep_effects_plan_on_success = _pipeline_effects_keep_plan_on_success()
 
                 for i, cut in enumerate(normalized_cuts, start=1):
                     start_tc = str(cut.get("start") or "").strip()
@@ -1542,12 +2458,12 @@ def run_once() -> int:
                     filename = str(cut.get("filename") or f"short_{i:02d}.mp4").strip()
                     if not start_tc or not end_tc or not filename:
                         continue
+                    _EVENT_SUMMARY["cuts_attempted"] = int(_EVENT_SUMMARY.get("cuts_attempted", 0)) + 1
                     start_s = _parse_ffmpeg_timestamp_to_seconds(start_tc)
                     end_s = _parse_ffmpeg_timestamp_to_seconds(end_tc)
                     if end_s <= start_s:
                         raise RuntimeError(f"Invalid cut range for {filename}: start={start_tc} end={end_tc}")
                     cut_duration_s = end_s - start_s
-                    rel_end_tc = _format_seconds_to_ffmpeg_timestamp(cut_duration_s)
 
                     cut_stitch_preset = str(cut.get("stitch_preset") or job.get("stitch_preset") or "").strip()
                     cut_text_preset = str(cut.get("text_preset") or job.get("preset") or "").strip()
@@ -1556,12 +2472,29 @@ def run_once() -> int:
                     cut_aspect = str(cut.get("aspect") or job.get("aspect") or "").strip()
                     cut_bg_mode = str(cut.get("bg_mode") or job.get("bg_mode") or "").strip()
                     cut_bpm = str(job.get("bpm") or manifest.get("stitch", {}).get("bpm") or "").strip()
+                    cut_collection_num = _normalize_collection_num(cut.get("collection_num"))
+
+                    cut_clip_sources = list(resolved.get("clip_specs") or resolved.get("clip_paths") or [])
+                    if cut_collection_num:
+                        filtered_sources = [
+                            item
+                            for item in cut_clip_sources
+                            if isinstance(item, dict)
+                            and _normalize_collection_num(item.get("collection_num")) == cut_collection_num
+                        ]
+                        if not filtered_sources:
+                            raise RuntimeError(
+                                f"No clips available for cut collection_num={cut_collection_num} filename={filename}."
+                            )
+                        cut_clip_sources = filtered_sources
 
                     media_key = re.sub(r"[^a-z0-9]+", "_", cut_stitch_preset.lower()) or "default"
+                    if cut_collection_num:
+                        media_key = f"{media_key}__collection_{cut_collection_num}"
                     media_root = media_root_cache.get(media_key, "")
                     if not media_root:
                         media_root = _build_stitcher_media_root(
-                            list(resolved.get("clip_specs") or resolved.get("clip_paths") or []),
+                            cut_clip_sources,
                             str(Path(paths["clips"]) / f"preset_{media_key}"),
                             stitch_preset=cut_stitch_preset,
                         )
@@ -1580,7 +2513,7 @@ def run_once() -> int:
                         end=end_tc,
                         output_path=cut_audio_path,
                     )
-                    _run_to_log(cut_audio_cmd, cut_audio_log, stage=f"cut_audio:{filename}")
+                    _run_to_log(cut_audio_cmd, cut_audio_log, stage=f"cut_audio:{filename}", cut_idx=i)
 
                     _slice_and_shift_srt_file(
                         input_path=resolved["lyrics_srt_path"],
@@ -1605,11 +2538,21 @@ def run_once() -> int:
                             end_s=end_s,
                         )
 
-                    cut_render_end = max(0.0, cut_duration_s + render_end_padding_s)
+                    # Per-cut architecture: render each short directly to the cut duration.
+                    cut_render_end = max(0.001, cut_duration_s)
+                    cut_expected_frames = max(1, int(round(cut_render_end * float(cut_fps))))
+                    out_short = str(Path(paths["outputs"]) / filename)
                     cut_base_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_base.mp4")
-                    cut_lyrics_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_lyrics.mp4")
-                    cut_final_stage_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_final.mp4")
+                    cut_effects_plan = str(Path(paths["outputs"]) / f"{cut_prefix}_effects_plan.json")
+                    cut_effects_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_effects.mp4")
+                    cut_lyrics_mp4 = (
+                        str(Path(paths["outputs"]) / f"{cut_prefix}_lyrics.mp4")
+                        if ("copy" in stage_plan and has_copy_for_cut)
+                        else out_short
+                    )
+                    cut_final_stage_mp4 = out_short
                     cut_stitch_log = str(Path(paths["logs"]) / f"{cut_prefix}_stitch.log")
+                    cut_effects_log = str(Path(paths["logs"]) / f"{cut_prefix}_effects.log")
                     cut_lyrics_log = str(Path(paths["logs"]) / f"{cut_prefix}_lyrics.log")
                     cut_copy_log = str(Path(paths["logs"]) / f"{cut_prefix}_copy.log")
 
@@ -1623,21 +2566,33 @@ def run_once() -> int:
                         "seed": cut_seed,
                         "output_local_path": cut_base_mp4,
                         "render_end_seconds": cut_render_end,
+                        "effects_pass1_mode": "base_only" if effects_pass2_enabled else "legacy",
+                        "effects_plan_out": cut_effects_plan if effects_pass2_enabled else "",
+                        "run_id": run_id,
+                        "cut_idx": i,
                     }
                     stitch_cmd = build_vse_stitcher_command(
                         stitch_job,
                         blender_bin=blender_bin,
                         script_path=VSE_STITCHER_SCRIPT_PATH,
                     )
+                    _assert_dir_exists(media_root, label=f"cut_idx={i} stitch media_root")
+                    _assert_file_exists(cut_audio_path, label=f"cut_idx={i} stitch audio")
                     try:
                         _run_to_log(
                             stitch_cmd,
                             cut_stitch_log,
                             stage=f"stitch:{filename}",
+                            cut_idx=i,
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
+                            output_probe_path=cut_base_mp4,
                         )
                     except Exception as stitch_exc:
+                        if effects_pass2_enabled:
+                            raise RuntimeError(
+                                f"effects_contract_fail reason=stitch_stage_failed_with_pass2 cut_idx={i} filename={filename} error={stitch_exc}"
+                            ) from stitch_exc
                         allow_stitch_fallback = os.environ.get("PIPELINE_STITCH_FALLBACK_COPY_FIRST", "1").strip() == "1"
                         if not allow_stitch_fallback:
                             raise
@@ -1648,13 +2603,73 @@ def run_once() -> int:
                             lf.write("\n")
                             lf.write(f"stitch_fallback=copy_first_clip reason={stitch_exc}\n")
                     if not Path(cut_base_mp4).exists() and resolved["clip_paths"]:
+                        if effects_pass2_enabled:
+                            raise RuntimeError(
+                                f"effects_contract_fail reason=missing_base_output_with_pass2 cut_idx={i} filename={filename}"
+                            )
                         shutil.copy2(resolved["clip_paths"][0], cut_base_mp4)
                         with Path(cut_stitch_log).open("a", encoding="utf-8") as lf:
                             lf.write("\n")
                             lf.write("stitch_fallback=copy_first_clip reason=missing_base_output\n")
+                    _emit_media_summary_event(path=cut_base_mp4, stage=f"stitch:{filename}", cut_idx=i)
+
+                    source_for_lyrics = cut_base_mp4
+                    if effects_pass2_enabled:
+                        if not Path(cut_effects_plan).exists():
+                            raise RuntimeError(
+                                f"effects_contract_fail reason=missing_effects_plan cut_idx={i} filename={filename} "
+                                f"path={cut_effects_plan}"
+                            )
+                        else:
+                            plan_sha = hashlib.sha1(Path(cut_effects_plan).read_bytes()).hexdigest()[:12]
+                            print(
+                                "effects_plan_written "
+                                f"cut_idx={i} filename={filename} path={cut_effects_plan} sha1={plan_sha}"
+                            )
+                            effects_cmd = build_vse_effects_command(
+                                {
+                                    "input_video_path": cut_base_mp4,
+                                    "input_audio_path": cut_audio_path,
+                                    "effects_plan_path": cut_effects_plan,
+                                    "fps": cut_fps,
+                                    "aspect": cut_aspect,
+                                    "output_local_path": cut_effects_mp4,
+                                    "render_end_seconds": cut_render_end,
+                                },
+                                blender_bin=blender_bin,
+                                script_path=VSE_EFFECTS_SCRIPT_PATH,
+                            )
+                            _assert_file_exists(cut_base_mp4, label=f"cut_idx={i} effects base_video")
+                            _assert_file_exists(cut_effects_plan, label=f"cut_idx={i} effects plan")
+                            _run_to_log(
+                                effects_cmd,
+                                cut_effects_log,
+                                stage=f"effects:{filename}",
+                                cut_idx=i,
+                                retries=blender_stage_retries,
+                                retry_delay_seconds=blender_retry_delay_s,
+                                output_probe_path=cut_effects_mp4,
+                            )
+                            if not Path(cut_effects_mp4).exists():
+                                raise RuntimeError(
+                                    f"effects_contract_fail reason=missing_effects_output cut_idx={i} filename={filename}"
+                                )
+                            _assert_expected_cut_output(
+                                output_path=cut_effects_mp4,
+                                expected_duration_s=float(cut_render_end),
+                                expected_frames=int(cut_expected_frames),
+                                stage=f"effects:{filename}",
+                                cut_idx=i,
+                            )
+                            _emit_media_summary_event(path=cut_effects_mp4, stage=f"effects:{filename}", cut_idx=i)
+                            print(
+                                "effects_apply_done "
+                                f"cut_idx={i} filename={filename} output={cut_effects_mp4}"
+                            )
+                            source_for_lyrics = cut_effects_mp4
 
                     lyrics_job = {
-                        "input_video_path": cut_base_mp4,
+                        "input_video_path": source_for_lyrics,
                         "input_srt_path": cut_lyrics_srt_path,
                         "input_audio_path": cut_audio_path,
                         "fps": cut_fps,
@@ -1663,31 +2678,49 @@ def run_once() -> int:
                         "bg_mode": cut_bg_mode,
                         "output_local_path": cut_lyrics_mp4,
                         "render_end_seconds": cut_render_end,
+                        "display_song_name": song_title_overlay["enabled"],
+                        "song_name": song_title_overlay["text"],
                     }
-                    if has_lyrics_for_cut:
+                    if shared_auto_baseline_wps > 0.0:
+                        lyrics_job["auto_baseline_wps"] = shared_auto_baseline_wps
+                    if has_lyrics_for_cut or song_title_overlay["enabled"]:
                         lyrics_cmd = build_vse_text_command(
                             lyrics_job,
                             blender_bin=blender_bin,
                             script_path=VSE_TEXT_SCRIPT_PATH,
                         )
+                        _assert_file_exists(source_for_lyrics, label=f"cut_idx={i} lyrics source_video")
+                        _assert_file_exists(cut_audio_path, label=f"cut_idx={i} lyrics audio")
+                        _assert_file_exists(cut_lyrics_srt_path, label=f"cut_idx={i} lyrics srt")
                         _run_to_log(
                             lyrics_cmd,
                             cut_lyrics_log,
                             stage=f"lyrics:{filename}",
+                            cut_idx=i,
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
+                            output_probe_path=cut_lyrics_mp4,
                         )
                         if not Path(cut_lyrics_mp4).exists():
-                            shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
+                            shutil.copy2(source_for_lyrics, cut_lyrics_mp4)
                             with Path(cut_lyrics_log).open("a", encoding="utf-8") as lf:
                                 lf.write("\n")
-                                lf.write("lyrics_fallback=copy_base reason=missing_lyrics_output\n")
+                                lf.write("lyrics_fallback=copy_source reason=missing_lyrics_output\n")
+                        if shared_auto_baseline_wps <= 0.0:
+                            shared_auto_baseline_wps = _extract_reveal_auto_speed_baseline_from_log(cut_lyrics_log)
+                            if shared_auto_baseline_wps > 0.0:
+                                print(
+                                    "per_cut_reveal_auto_anchor "
+                                    f"cut_idx={i} filename={filename} baseline_wps={shared_auto_baseline_wps:.3f}"
+                                )
+                        _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
                     else:
-                        shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
+                        shutil.copy2(source_for_lyrics, cut_lyrics_mp4)
                         Path(cut_lyrics_log).write_text(
-                            "lyrics_fallback=copy_base reason=empty_lyrics_srt\n",
+                            "lyrics_fallback=copy_source reason=empty_lyrics_srt\n",
                             encoding="utf-8",
                         )
+                        _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
 
                     selected_cut_source = cut_lyrics_mp4
                     selected_copy_log = ""
@@ -1708,29 +2741,98 @@ def run_once() -> int:
                             blender_bin=blender_bin,
                             script_path=VSE_TEXT_SCRIPT_PATH,
                         )
+                        _assert_file_exists(cut_lyrics_mp4, label=f"cut_idx={i} copy source_video")
+                        _assert_file_exists(cut_audio_path, label=f"cut_idx={i} copy audio")
+                        _assert_file_exists(cut_copy_srt_path, label=f"cut_idx={i} copy srt")
                         _run_to_log(
                             copy_cmd,
                             cut_copy_log,
                             stage=f"copy:{filename}",
+                            cut_idx=i,
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
+                            output_probe_path=cut_final_stage_mp4,
                         )
-                        if Path(cut_final_stage_mp4).exists():
-                            selected_cut_source = cut_final_stage_mp4
-                            selected_copy_log = cut_copy_log
+                        if not Path(cut_final_stage_mp4).exists():
+                            shutil.copy2(cut_lyrics_mp4, cut_final_stage_mp4)
+                            with Path(cut_copy_log).open("a", encoding="utf-8") as lf:
+                                lf.write("\n")
+                                lf.write("copy_fallback=use_lyrics reason=missing_copy_output\n")
+                        _emit_media_summary_event(path=cut_final_stage_mp4, stage=f"copy:{filename}", cut_idx=i)
+                        selected_cut_source = cut_final_stage_mp4
+                        selected_copy_log = cut_copy_log
 
-                    out_short = str(Path(paths["outputs"]) / filename)
-                    cut_log = str(Path(paths["logs"]) / f"{cut_prefix}.log")
-                    cut_cmd = build_ffmpeg_cut_command(
-                        ffmpeg_bin=ffmpeg_bin,
-                        input_path=selected_cut_source,
-                        start="00:00:00.000",
-                        end=rel_end_tc,
+                    if selected_cut_source != out_short:
+                        shutil.copy2(selected_cut_source, out_short)
+                    _assert_expected_cut_output(
                         output_path=out_short,
+                        expected_duration_s=float(cut_render_end),
+                        expected_frames=int(cut_expected_frames),
+                        stage=f"short:{filename}",
+                        cut_idx=i,
                     )
-                    _run_to_log(cut_cmd, cut_log, stage=f"cut:{filename}")
-                    shorts.append(out_short)
+                    _emit_media_summary_event(path=out_short, stage=f"short:{filename}", cut_idx=i)
+                    _EVENT_SUMMARY["cuts_succeeded"] = int(_EVENT_SUMMARY.get("cuts_succeeded", 0)) + 1
+
+                    cut_log = selected_copy_log or cut_lyrics_log
                     cut_logs.append(cut_log)
+
+                    if is_drive_output:
+                        if client is None:
+                            raise RuntimeError("Drive client is required for output_mode=drive")
+                        short_row = _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=str(job.get("campaign_id") or ""),
+                            artifact_type=f"pipeline_short_{i:02d}",
+                            file_path=out_short,
+                            created_utc=_utc_now_iso(),
+                        )
+                        short_artifact_type = str(short_row.get("artifact_type") or "")
+                        short_filename = str(short_row.get("filename") or "")
+                        if should_upload_artifact(
+                            existing_rows,
+                            run_id=run_id,
+                            artifact_type=short_artifact_type,
+                            filename=short_filename,
+                        ):
+                            short_row = _upload_confirm_record_and_delete(
+                                gw=gw,
+                                control_sheet_id=control_sheet_id,
+                                client=client,
+                                artifact_row=short_row,
+                                drive_folder_id=drive_folder_id,
+                                verify_mode=verify_mode,
+                            )
+                        else:
+                            existing = _find_existing_uploaded_artifact(
+                                existing_rows,
+                                run_id=run_id,
+                                artifact_type=short_artifact_type,
+                                filename=short_filename,
+                            )
+                            if existing:
+                                short_row["drive_file_id"] = str(existing.get("drive_file_id") or "")
+                                short_row["drive_folder_id"] = str(existing.get("drive_folder_id") or drive_folder_id)
+                            append_outputs_index_rows(gw, control_sheet_id, [short_row])
+                            _delete_local_file_best_effort(out_short)
+                        artifacts_written += 1
+                        existing_rows.append(short_row)
+                        uploaded_short_rows.append(short_row)
+                    else:
+                        shorts.append(out_short)
+
+                    preserve_primary_files = (not have_primary) and (not is_drive_output)
+                    # Free per-cut intermediates once the short result is safely persisted.
+                    for transient in (cut_audio_path, cut_lyrics_srt_path, cut_copy_srt_path):
+                        _delete_local_file_best_effort(transient)
+                    if not preserve_primary_files:
+                        for transient in (cut_base_mp4, cut_effects_mp4, cut_lyrics_mp4):
+                            _delete_local_file_best_effort(transient)
+                        if effects_pass2_enabled and (not keep_effects_plan_on_success):
+                            _delete_local_file_best_effort(cut_effects_plan)
+                        if selected_copy_log and cut_final_stage_mp4 != out_short:
+                            _delete_local_file_best_effort(cut_final_stage_mp4)
 
                     if not have_primary:
                         have_primary = True
@@ -1747,78 +2849,70 @@ def run_once() -> int:
                     main_lyrics_cues=main_lyrics_cues,
                     cuts_with_lyrics=cuts_with_lyrics,
                 ):
-                    print(
-                        "per_cut_lyrics_empty_fallback=legacy_full_render "
-                        f"main_lyrics_cues={main_lyrics_cues} cuts_with_lyrics={cuts_with_lyrics}"
+                    raise RuntimeError(
+                        "pipeline_v1 per-cut mode produced zero lyric-bearing cuts "
+                        f"despite non-empty lyrics SRT (main_lyrics_cues={main_lyrics_cues})."
                     )
-                    print("pipeline_v1_mode=legacy_full_length reason=per_cut_zero_lyrics")
-                    (
-                        base_mp4,
-                        lyrics_mp4,
-                        final_mp4,
-                        stitch_log,
-                        lyrics_log,
-                        copy_log,
-                        shorts,
-                        cut_logs,
-                    ) = _run_pipeline_full_length()
             else:
-                print("pipeline_v1_mode=legacy_full_length")
-                (
-                    base_mp4,
-                    lyrics_mp4,
-                    final_mp4,
-                    stitch_log,
-                    lyrics_log,
-                    copy_log,
-                    shorts,
-                    cut_logs,
-                ) = _run_pipeline_full_length()
+                if not per_cut_render:
+                    raise RuntimeError(
+                        "pipeline_v1 legacy full-length mode is disabled in this build. "
+                        "Set PIPELINE_PER_CUT_RENDER=1."
+                    )
+                raise RuntimeError("pipeline_v1 per-cut mode requires at least one valid manifest cut.")
 
             created = _utc_now_iso()
             campaign_id = str(job.get("campaign_id") or "")
-            artifact_rows: list[dict[str, Any]] = [
-                _build_output_row_from_file(
-                    run_id=run_id,
-                    render_job_id=render_job_id,
-                    campaign_id=campaign_id,
-                    artifact_type="pipeline_base_mp4",
-                    file_path=base_mp4,
-                    created_utc=created,
-                ),
-                _build_output_row_from_file(
-                    run_id=run_id,
-                    render_job_id=render_job_id,
-                    campaign_id=campaign_id,
-                    artifact_type="pipeline_lyrics_mp4",
-                    file_path=lyrics_mp4,
-                    created_utc=created,
-                ),
-                _build_output_row_from_file(
-                    run_id=run_id,
-                    render_job_id=render_job_id,
-                    campaign_id=campaign_id,
-                    artifact_type="pipeline_final_mp4",
-                    file_path=final_mp4,
-                    created_utc=created,
-                ),
-                _build_output_row_from_file(
-                    run_id=run_id,
-                    render_job_id=render_job_id,
-                    campaign_id=campaign_id,
-                    artifact_type="pipeline_stitch_log",
-                    file_path=stitch_log,
-                    created_utc=created,
-                ),
-                _build_output_row_from_file(
-                    run_id=run_id,
-                    render_job_id=render_job_id,
-                    campaign_id=campaign_id,
-                    artifact_type="pipeline_lyrics_log",
-                    file_path=lyrics_log,
-                    created_utc=created,
-                ),
-            ]
+            artifact_rows: list[dict[str, Any]] = []
+            if not (is_drive_output and uploaded_short_rows):
+                artifact_rows.extend(
+                    [
+                        _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=campaign_id,
+                            artifact_type="pipeline_base_mp4",
+                            file_path=base_mp4,
+                            created_utc=created,
+                        ),
+                        _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=campaign_id,
+                            artifact_type="pipeline_lyrics_mp4",
+                            file_path=lyrics_mp4,
+                            created_utc=created,
+                        ),
+                        _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=campaign_id,
+                            artifact_type="pipeline_final_mp4",
+                            file_path=final_mp4,
+                            created_utc=created,
+                        ),
+                    ]
+                )
+            artifact_rows.extend(
+                [
+                    _build_output_row_from_file(
+                        run_id=run_id,
+                        render_job_id=render_job_id,
+                        campaign_id=campaign_id,
+                        artifact_type="pipeline_stitch_log",
+                        file_path=stitch_log,
+                        created_utc=created,
+                    ),
+                    _build_output_row_from_file(
+                        run_id=run_id,
+                        render_job_id=render_job_id,
+                        campaign_id=campaign_id,
+                        artifact_type="pipeline_lyrics_log",
+                        file_path=lyrics_log,
+                        created_utc=created,
+                    ),
+                ]
+            )
             if copy_log:
                 artifact_rows.append(
                     _build_output_row_from_file(
@@ -1830,17 +2924,18 @@ def run_once() -> int:
                         created_utc=created,
                     )
                 )
-            for i, short_path in enumerate(shorts, start=1):
-                artifact_rows.append(
-                    _build_output_row_from_file(
-                        run_id=run_id,
-                        render_job_id=render_job_id,
-                        campaign_id=campaign_id,
-                        artifact_type=f"pipeline_short_{i:02d}",
-                        file_path=short_path,
-                        created_utc=created,
+            if not is_drive_output:
+                for i, short_path in enumerate(shorts, start=1):
+                    artifact_rows.append(
+                        _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=campaign_id,
+                            artifact_type=f"pipeline_short_{i:02d}",
+                            file_path=short_path,
+                            created_utc=created,
+                        )
                     )
-                )
             for i, log_path in enumerate(cut_logs, start=1):
                 artifact_rows.append(
                     _build_output_row_from_file(
@@ -1852,26 +2947,26 @@ def run_once() -> int:
                         created_utc=created,
                     )
                 )
-
-            output_mode = str(job.get("output_mode") or "local").strip().lower()
-            if output_mode == "drive":
-                dst_parent = _require_job_field(job, "output_drive_folder_id", renderer=renderer)
-                client = drive_upload_from_env()
-                folder_name = build_pipeline_subfolder_name(campaign_id, run_id)
-                if folder_name:
-                    drive_folder_id = client.find_folder_by_name(folder_name, dst_parent) or client.create_folder(
-                        folder_name, dst_parent
+            events_path = _event_log_path()
+            if events_path and Path(events_path).exists():
+                artifact_rows.append(
+                    _build_output_row_from_file(
+                        run_id=run_id,
+                        render_job_id=render_job_id,
+                        campaign_id=campaign_id,
+                        artifact_type="pipeline_events_jsonl",
+                        file_path=events_path,
+                        created_utc=created,
                     )
-                else:
-                    drive_folder_id = dst_parent
-                existing_rows = read_outputs_index_all(gw, control_sheet_id)
-                run_ids_with_shorts = _pipeline_run_ids_with_shorts(existing_rows)
-                if any(str(r.get("artifact_type") or "").strip().lower().startswith("pipeline_short_") for r in artifact_rows):
-                    run_ids_with_shorts.add(run_id)
+                )
+
+            if is_drive_output:
+                if client is None:
+                    raise RuntimeError("Drive client is required for output_mode=drive")
                 for row in artifact_rows:
                     artifact_type = str(row.get("artifact_type") or "")
                     filename = str(row.get("filename") or "")
-                    if not _is_pipeline_final_video_artifact(
+                    if not _is_pipeline_drive_upload_artifact(
                         artifact_type=artifact_type,
                         run_id=run_id,
                         run_ids_with_shorts=run_ids_with_shorts,
@@ -1885,6 +2980,10 @@ def run_once() -> int:
                     ):
                         local_path = str(row.get("notes") or "").replace("local_path=", "", 1)
                         drive_file_id = client.upload_file(local_path, drive_folder_id, _guess_mime_type(local_path))
+                        if verify_mode == "size":
+                            client.confirm_upload_size(drive_file_id, _to_int(row.get("bytes"), 0))
+                        else:
+                            raise RuntimeError(f"Unsupported PIPELINE_UPLOAD_VERIFY_MODE: {verify_mode}")
                         row["drive_file_id"] = drive_file_id
                         row["drive_folder_id"] = drive_folder_id
                     else:
@@ -1922,9 +3021,8 @@ def run_once() -> int:
                         drive_file_id=manifest_drive_file_id,
                         reason=f"input_manifest render_job_id={render_job_id}",
                     )
-            elif output_mode != "local":
-                raise RuntimeError(f"Unsupported output_mode: {output_mode}")
-            artifacts_written = append_outputs_index_rows(gw, control_sheet_id, artifact_rows)
+            artifacts_written += append_outputs_index_rows(gw, control_sheet_id, artifact_rows)
+            pipeline_run_succeeded = True
         else:
             raise RuntimeError("Renderer not implemented; set renderer=noop for smoke validation.")
 
@@ -1952,11 +3050,21 @@ def run_once() -> int:
         run_row["updated_utc"] = finished
         run_row["artifacts_written"] = artifacts_written
         upsert_render_run(gw, control_sheet_id, run_row)
+        _emit_event(
+            event="run_end",
+            stage="run",
+            message="render run succeeded",
+            code="",
+            artifacts_written=int(artifacts_written),
+            summary=dict(_EVENT_SUMMARY),
+        )
         print(f"Render run success: run_id={run_id} render_job_id={render_job_id} artifacts_written={artifacts_written}")
         return 0
     except Exception as e:
         if isinstance(e, DriveUploadError):
             e = RuntimeError(str(e))
+        err_text = str(e)
+        err_code = _classify_error_code(err_text)
         finished = _utc_now_iso()
         mark_failed(gw, control_sheet_id, render_job_id, run_id, str(e), now_utc=finished)
         run_row["status"] = RENDER_STATUS_FAILED
@@ -1964,8 +3072,59 @@ def run_once() -> int:
         run_row["updated_utc"] = finished
         run_row["error_msg"] = str(e)
         upsert_render_run(gw, control_sheet_id, run_row)
+        _emit_event(
+            event="run_fail",
+            stage="run",
+            severity="error",
+            code=err_code,
+            message="render run failed",
+            exception=err_text,
+            summary=dict(_EVENT_SUMMARY),
+        )
+        if pipeline_paths_for_cleanup is not None and _pipeline_forensics_on_failure():
+            summary_path, bundle_path = _build_forensics_bundle(
+                run_id=run_id,
+                render_job_id=render_job_id,
+                run_root=str(pipeline_paths_for_cleanup.get("root") or ""),
+                error_message=err_text,
+            )
+            if summary_path:
+                pipeline_paths_for_cleanup["diagnostics"] = str(Path(summary_path).parent.parent)
+            if _pipeline_forensics_upload_enabled():
+                try:
+                    uploaded = _upload_failure_diagnostics(
+                        gw=gw,
+                        control_sheet_id=control_sheet_id,
+                        client=pipeline_diag_client,
+                        drive_folder_id=pipeline_diag_drive_folder_id,
+                        run_id=run_id,
+                        render_job_id=render_job_id,
+                        campaign_id=pipeline_diag_campaign_id,
+                        verify_mode=pipeline_diag_verify_mode,
+                        summary_path=summary_path,
+                        bundle_path=bundle_path,
+                    )
+                    if uploaded > 0:
+                        run_row["artifacts_written"] = int(run_row.get("artifacts_written") or 0) + int(uploaded)
+                        run_row["updated_utc"] = _utc_now_iso()
+                        upsert_render_run(gw, control_sheet_id, run_row)
+                except Exception as diag_exc:
+                    _emit_event(
+                        event="forensics_upload_fail",
+                        stage="forensics",
+                        severity="warning",
+                        code=_classify_error_code(str(diag_exc)),
+                        message="forensics upload failed",
+                        exception=str(diag_exc),
+                    )
         print(f"Render run failed: run_id={run_id} render_job_id={render_job_id} error={e}", file=sys.stderr)
         return 1
+    finally:
+        if pipeline_paths_for_cleanup is not None:
+            _cleanup_pipeline_local_artifacts(
+                pipeline_paths_for_cleanup,
+                success=bool(pipeline_run_succeeded),
+            )
 
 
 def loop_forever() -> int:

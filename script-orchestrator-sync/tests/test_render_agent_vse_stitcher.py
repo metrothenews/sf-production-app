@@ -52,6 +52,68 @@ def test_build_vse_stitcher_command_arg_ordering() -> None:
     ]
 
 
+def test_build_vse_stitcher_command_includes_effects_pass_flags() -> None:
+    cmd = render_agent.build_vse_stitcher_command(
+        {
+            "media_root_path": "/tmp/in/media_root",
+            "input_audio_path": "/tmp/in/master.wav",
+            "bpm": "136",
+            "fps": "30",
+            "aspect": "9:16",
+            "stitch_preset": "4p4sbc4f4t2sp2u2c2wm",
+            "seed": "99",
+            "output_local_path": "/tmp/out/base.mp4",
+            "effects_pass1_mode": "base_only",
+            "effects_plan_out": "/tmp/out/cut_01_effects_plan.json",
+            "run_id": "run_123",
+            "cut_idx": 1,
+        },
+        blender_bin="/opt/blender/blender",
+        script_path="/abs/vse_stitcher.py",
+    )
+    assert "--effects-pass1-mode" in cmd
+    assert "--effects-plan-out" in cmd
+    assert "--run-id" in cmd
+    assert "--cut-idx" in cmd
+    assert cmd[cmd.index("--effects-pass1-mode") + 1] == "base_only"
+    assert cmd[cmd.index("--effects-plan-out") + 1] == "/tmp/out/cut_01_effects_plan.json"
+    assert cmd[cmd.index("--run-id") + 1] == "run_123"
+    assert cmd[cmd.index("--cut-idx") + 1] == "1"
+
+
+def test_build_vse_effects_command_arg_ordering() -> None:
+    cmd = render_agent.build_vse_effects_command(
+        {
+            "input_video_path": "/tmp/out/base.mp4",
+            "input_audio_path": "/tmp/in/master.wav",
+            "effects_plan_path": "/tmp/out/cut_01_effects_plan.json",
+            "fps": "30",
+            "aspect": "9:16",
+            "output_local_path": "/tmp/out/effects.mp4",
+            "render_end_seconds": 12.34,
+        },
+        blender_bin="/opt/blender/blender",
+        script_path="/abs/vse_effects_pass.py",
+    )
+    assert cmd[0] == "/opt/blender/blender"
+    assert cmd[1:5] == ["-b", "--python", "/abs/vse_effects_pass.py", "--"]
+    assert cmd[5:17] == [
+        "--input-video",
+        "/tmp/out/base.mp4",
+        "--audio",
+        "/tmp/in/master.wav",
+        "--effects-plan",
+        "/tmp/out/cut_01_effects_plan.json",
+        "--fps",
+        "30",
+        "--aspect",
+        "9:16",
+        "--output",
+        "/tmp/out/effects.mp4",
+    ]
+    assert "--render-end-seconds" in cmd
+
+
 def test_build_pipeline_subfolder_name_defaults_to_campaign(monkeypatch) -> None:
     monkeypatch.delenv("PIPELINE_OUTPUT_SUBFOLDER_MODE", raising=False)
     out = render_agent.build_pipeline_subfolder_name("Test Video 001", "run123")

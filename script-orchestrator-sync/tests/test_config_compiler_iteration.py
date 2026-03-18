@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import random
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,8 @@ _SPEC.loader.exec_module(compiler)
 def test_required_run_count_ceil_division() -> None:
     assert compiler._required_run_count(12, 2) == 6
     assert compiler._required_run_count(13, 2) == 7
-    assert compiler._required_run_count(0, 2) == 1
+    with pytest.raises(RuntimeError, match=r"Number of Videos must be >= 1"):
+        compiler._required_run_count(0, 2)
 
 
 def test_render_job_id_for_iteration_suffixing() -> None:
@@ -32,9 +34,24 @@ def test_normalize_text_preset_name() -> None:
     assert compiler._normalize_text_preset_name("") == ""
 
 
+def test_config_range_default_covers_shifted_columns() -> None:
+    assert compiler.CONFIG_RANGE_DEFAULT == "A1:ZZ2"
+
+
 def test_resolve_stitch_bpm_prefers_song_bpm_column() -> None:
     cfg = {"Song BPM": "136", "BPM": "120"}
     assert compiler.resolve_stitch_bpm(cfg) == 136.0
+
+
+def test_resolve_song_title_overlay_enabled() -> None:
+    cfg = {"Display Song Name?": "TRUE", "Song Name": "Track Name"}
+    out = compiler.resolve_song_title_overlay(cfg)
+    assert out == {"enabled": True, "text": "Track Name"}
+
+
+def test_resolve_song_title_overlay_requires_text_when_enabled() -> None:
+    with pytest.raises(RuntimeError, match=r"Song Name is empty"):
+        compiler.resolve_song_title_overlay({"Display Song Name?": "TRUE", "Song Name": ""})
 
 
 def test_resolve_stitch_bpm_falls_back_to_env(monkeypatch) -> None:
@@ -116,7 +133,7 @@ def test_non_multiple_video_count_trims_last_iteration() -> None:
     assert sum(run_cut_counts) == number_of_videos
 
 
-def test_collection_pool_for_run_alternates_across_1_to_6() -> None:
+def test_select_random_collection_pools_for_cuts_avoids_consecutive_repeats() -> None:
     pools = [
         {"collection_num": "1"},
         {"collection_num": "2"},
@@ -125,40 +142,44 @@ def test_collection_pool_for_run_alternates_across_1_to_6() -> None:
         {"collection_num": "5"},
         {"collection_num": "6"},
     ]
-    seq = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(14)]
-    assert seq == ["1", "2", "3", "4", "5", "6", "1", "2", "3", "4", "5", "6", "1", "2"]
+    seq_rows, _ = compiler._select_random_collection_pools_for_cuts(
+        pools,
+        cut_count=20,
+        rng=random.Random(42),
+        previous_collection_num="",
+    )
+    seq = [str(row["collection_num"]) for row in seq_rows]
+    assert len(seq) == 20
+    for idx in range(1, len(seq)):
+        assert seq[idx] != seq[idx - 1]
 
 
-def test_collection_alternation_is_per_full_length_run_not_per_cut() -> None:
-    cfg = {
-        "Cut Clips?": "TRUE",
-        "Clip 1": "TRUE",
-        "Clip 1 Start": "00:00:00:00",
-        "Clip 1 End": "00:00:02:00",
-        "Clip 2": "TRUE",
-        "Clip 2 Start": "00:00:02:00",
-        "Clip 2 End": "00:00:04:00",
-    }
-    clip_count = len(compiler.build_cuts_from_config(cfg, naming_convention="Example_000", start_index=1))
-    assert clip_count == 2
-
-    # 17 requested short videos with 2 cuts/run => 9 full-length runs.
-    required_runs = compiler._required_run_count(17, clip_count)
-    assert required_runs == 9
-    pools = [
-        {"collection_num": "1"},
-        {"collection_num": "2"},
-        {"collection_num": "3"},
-        {"collection_num": "4"},
-        {"collection_num": "5"},
-        {"collection_num": "6"},
-    ]
-    run_sequence = [compiler._collection_pool_for_run(pools, i)["collection_num"] for i in range(required_runs)]
-    assert run_sequence == ["1", "2", "3", "4", "5", "6", "1", "2", "3"]
+def test_select_random_collection_pools_for_cuts_carries_previous_across_calls() -> None:
+    pools = [{"collection_num": "1"}, {"collection_num": "2"}, {"collection_num": "3"}]
+    rng = random.Random(7)
+    first_rows, previous = compiler._select_random_collection_pools_for_cuts(
+        pools,
+        cut_count=5,
+        rng=rng,
+        previous_collection_num="",
+    )
+    second_rows, _ = compiler._select_random_collection_pools_for_cuts(
+        pools,
+        cut_count=5,
+        rng=rng,
+        previous_collection_num=previous,
+    )
+    assert first_rows
+    assert second_rows
+    assert first_rows[-1]["collection_num"] != second_rows[0]["collection_num"]
 
 
-def test_collection_pool_for_run_errors_on_invalid_input() -> None:
+def test_select_random_collection_pools_for_cuts_errors_on_invalid_input() -> None:
     with pytest.raises(RuntimeError, match=r"No collection pools available"):
-        compiler._collection_pool_for_run([], 0)
-    with pytest.raises(ValueError, match=r"run_index must be >= 0"):
-        compiler._collection_pool_for_run([{"collection_num": "1"}], -1)
+        compiler._select_random_collection_pools_for_cuts([], cut_count=1, rng=random.Random(1))
+    with pytest.raises(RuntimeError, match=r"At least two"):
+        compiler._select_random_collection_pools_for_cuts(
+            [{"collection_num": "1"}],
+            cut_count=2,
+            rng=random.Random(1),
+        )

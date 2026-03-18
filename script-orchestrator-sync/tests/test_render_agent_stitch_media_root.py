@@ -13,9 +13,14 @@ render_agent = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(render_agent)
 
 
-def test_extract_stitch_categories_from_exec_preset() -> None:
-    out = render_agent._extract_stitch_categories("1p1u1f1c1m1t")
-    assert out == ["P", "U", "F", "C", "M", "T"]
+def test_extract_stitch_categories_from_modifier_preset() -> None:
+    out = render_agent._extract_stitch_categories("4p4sbc4f4t2sp2u2c2wm")
+    assert out == ["P", "C", "F", "T", "U", "M"]
+
+
+def test_extract_stitch_categories_legacy_preset_still_works() -> None:
+    out = render_agent._extract_stitch_categories("4a4b4c")
+    assert out == ["A", "B", "C"]
 
 
 def test_build_stitcher_media_root_routes_by_clip_category(tmp_path: Path) -> None:

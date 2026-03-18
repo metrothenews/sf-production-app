@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import re
 import shutil
 import subprocess
@@ -153,6 +154,14 @@ DEFAULT_PRESET: Dict[str, Any] = {
         "style": "manual",  # manual|step
         "show": "cumulative",
         "preserve_spacing": False,
+        "auto_speed": {
+            "enabled": False,
+            "baseline_quantile": 0.70,
+            "max_speedup": 2.0,
+            "gamma": 1.0,
+            "min_words_for_baseline": 3,
+            "fallback_baseline_wps": 2.5,
+        },
     },
     # Manual per-word layout knobs
     "manual_layout": {
@@ -231,7 +240,93 @@ _SRT_BREAK_RE = re.compile(r"(?is)<\s*br\s*/?\s*>")
 
 # Temporary global timing tweak: render lyrics 0.5s earlier than cue timestamps.
 # Keep this centralized so we can tune/remove it later.
-HARDCODED_LYRIC_ADVANCE_MS = 500
+HARDCODED_LYRIC_ADVANCE_MS = 150
+
+
+def _count_words_for_reveal(text: str) -> int:
+    return len([w for w in re.split(r"\s+", str(text or "").strip()) if w])
+
+
+def _quantile(values: List[float], q: float) -> float:
+    vals = sorted(float(v) for v in values if math.isfinite(float(v)))
+    if not vals:
+        raise ValueError("quantile requires at least one finite value")
+    if len(vals) == 1:
+        return float(vals[0])
+    qq = min(1.0, max(0.0, float(q)))
+    pos = qq * float(len(vals) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(vals[lo])
+    frac = pos - float(lo)
+    return float(vals[lo] + (vals[hi] - vals[lo]) * frac)
+
+
+def _cue_density_wps(*, words: int, duration_ms: int) -> float:
+    if int(words) <= 0 or int(duration_ms) <= 0:
+        return 0.0
+    return float(words) / (float(duration_ms) / 1000.0)
+
+
+def _compute_auto_speed_baseline_wps(
+    cues: List[Cue],
+    *,
+    baseline_quantile: float,
+    min_words_for_baseline: int,
+    fallback_baseline_wps: float,
+) -> float:
+    densities: List[float] = []
+    min_words = max(1, int(min_words_for_baseline))
+    for cue in cues:
+        words = _count_words_for_reveal(cue.text)
+        if words < min_words:
+            continue
+        duration_ms = int(cue.end_ms) - int(cue.start_ms)
+        density = _cue_density_wps(words=words, duration_ms=duration_ms)
+        if density > 0.0:
+            densities.append(float(density))
+    if not densities:
+        return max(0.01, float(fallback_baseline_wps))
+    return max(0.01, _quantile(densities, float(baseline_quantile)))
+
+
+def _compute_auto_reveal_speed_multiplier(
+    *,
+    words: int,
+    duration_ms: int,
+    baseline_wps: float,
+    max_speedup: float,
+    gamma: float,
+) -> float:
+    density = _cue_density_wps(words=int(words), duration_ms=int(duration_ms))
+    if density <= 0.0:
+        return 1.0
+    baseline = max(0.01, float(baseline_wps))
+    max_up = max(1.0, float(max_speedup))
+    exponent = max(0.0, float(gamma))
+    raw = (baseline / density) ** exponent if exponent > 0.0 else 1.0
+    return max(1.0, min(max_up, float(raw)))
+
+
+def _compute_reveal_window_frames(*, total_frames: int, speed: float) -> int:
+    tf = max(1, int(total_frames))
+    spd = max(1.0, float(speed))
+    reveal = int(round(float(tf) / spd))
+    return max(1, min(tf, int(reveal)))
+
+
+def _compute_word_reveal_start_frame(
+    *,
+    start_f: int,
+    end_f_excl: int,
+    reveal_frames: int,
+    n_words: int,
+    word_index: int,
+) -> int:
+    denom = max(1, int(n_words))
+    ws = int(start_f) + (int(word_index) * int(reveal_frames)) // denom
+    return max(int(start_f), min(int(ws), int(end_f_excl) - 1))
 
 
 def _normalize_srt_linebreak_tokens(s: str) -> str:
@@ -1353,6 +1448,86 @@ def _channel_overlaps(windows: List[Tuple[int, int]], start: int, end_excl: int)
     return False
 
 
+def _find_free_channel_for_range(
+    scene: bpy.types.Scene,
+    *,
+    frame_start: int,
+    frame_end_excl: int,
+    preferred_channel: int,
+) -> int:
+    se = scene.sequence_editor
+    if se is None:
+        return max(1, min(MAX_VSE_CHANNEL, int(preferred_channel)))
+    windows_by_channel: Dict[int, List[Tuple[int, int]]] = {}
+    for strip in list(_all_strips(se)):
+        ch = int(getattr(strip, "channel", 0) or 0)
+        if ch < 1 or ch > MAX_VSE_CHANNEL:
+            continue
+        try:
+            st, en = _strip_start_end_excl(strip)
+        except Exception:
+            continue
+        windows_by_channel.setdefault(ch, []).append((int(st), int(en)))
+    start_ch = max(1, min(MAX_VSE_CHANNEL, int(preferred_channel)))
+    ordered = list(range(start_ch, MAX_VSE_CHANNEL + 1)) + list(range(1, start_ch))
+    for ch in ordered:
+        wins = windows_by_channel.get(ch, [])
+        if not _channel_overlaps(wins, int(frame_start), int(frame_end_excl)):
+            return ch
+    raise RuntimeError("Unable to allocate a free channel for static song-title overlay.")
+
+
+def add_song_title_overlay(
+    scene: bpy.types.Scene,
+    *,
+    title: str,
+    frame_start: int,
+    frame_end_excl: int,
+    preferred_channel: int,
+    font_path: str,
+    font_size: int,
+    safe_margin: float,
+    text_rgb: Tuple[float, float, float],
+    text_alpha: float,
+    outline: int,
+    shadow: int,
+) -> None:
+    song_name = str(title or "").strip()
+    if not song_name:
+        return
+    channel = _find_free_channel_for_range(
+        scene,
+        frame_start=int(frame_start),
+        frame_end_excl=int(frame_end_excl),
+        preferred_channel=int(preferred_channel),
+    )
+    # Keep title low in the top black bar, just above stock footage.
+    title_pos_y = max(0.0, min(1.0, 1.0 - float(safe_margin) - 0.035))
+    strip = add_text_effect(
+        scene,
+        text=song_name,
+        channel=int(channel),
+        frame_start=int(frame_start),
+        frame_end_excl=int(frame_end_excl),
+        name="SONG_TITLE",
+    )
+    apply_text_style(
+        strip,
+        font_path=str(font_path or ""),
+        font_size=max(1, int(font_size)),
+        align_x="CENTER",
+        align_y="BOTTOM",
+        pos_x=0.5,
+        pos_y=float(title_pos_y),
+        use_box=False,
+        box_padding=0.0,
+        outline=int(outline),
+        shadow=int(shadow),
+        text_rgb=text_rgb,
+        text_alpha=text_alpha,
+    )
+
+
 def pick_channel_block(
     occupied: Dict[int, List[Tuple[int, int]]],
     *,
@@ -1719,6 +1894,36 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
     reveal_mode = str(reveal.get("mode", "none")).lower().strip()
     reveal_style = str(reveal.get("style", "manual")).lower().strip()
     reveal_show = str(reveal.get("show", "cumulative")).lower().strip()
+    do_manual_words_mode = (reveal_mode == "words" and reveal_style == "manual" and reveal_show == "cumulative")
+
+    reveal_auto_cfg_raw = reveal.get("auto_speed", {})
+    reveal_auto_cfg = dict(reveal_auto_cfg_raw) if isinstance(reveal_auto_cfg_raw, dict) else {}
+    auto_speed_enabled = do_manual_words_mode and bool(reveal_auto_cfg.get("enabled", False))
+    auto_baseline_quantile = float(reveal_auto_cfg.get("baseline_quantile", 0.70))
+    auto_max_speedup = float(reveal_auto_cfg.get("max_speedup", 2.0))
+    auto_gamma = float(reveal_auto_cfg.get("gamma", 1.0))
+    auto_min_words = int(reveal_auto_cfg.get("min_words_for_baseline", 3))
+    auto_fallback_baseline = float(reveal_auto_cfg.get("fallback_baseline_wps", 2.5))
+    auto_baseline_wps = auto_fallback_baseline
+    auto_baseline_override_wps = max(0.0, float(getattr(args, "auto_baseline_wps", 0.0) or 0.0))
+    if auto_speed_enabled:
+        if auto_baseline_override_wps > 0.0:
+            auto_baseline_wps = auto_baseline_override_wps
+        else:
+            auto_baseline_wps = _compute_auto_speed_baseline_wps(
+                cooked,
+                baseline_quantile=auto_baseline_quantile,
+                min_words_for_baseline=auto_min_words,
+                fallback_baseline_wps=auto_fallback_baseline,
+            )
+        print(
+            "reveal_auto_speed_baseline "
+            f"baseline_wps={auto_baseline_wps:.3f} "
+            f"source={'override' if auto_baseline_override_wps > 0.0 else 'computed'} "
+            f"quantile={auto_baseline_quantile:.3f} "
+            f"min_words={auto_min_words} "
+            f"fallback_wps={auto_fallback_baseline:.3f}"
+        )
 
     for cue in cooked:
         start_f = ms_to_frame(int(cue.start_ms), int(args.fps))
@@ -1734,7 +1939,7 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
             pix_cfg_local["ch_offset_1"] = int(pix_off1_local)
             pix_cfg_local["ch_offset_2"] = int(pix_off2_local)
 
-        do_manual_words = (reveal_mode == "words" and reveal_style == "manual" and reveal_show == "cumulative")
+        do_manual_words = do_manual_words_mode
         if do_manual_words:
             ml = resolve_manual_layout_config(p)
             font_id = _blf_font_id(str(p["font_path"]) if p["font_path"] else "") if (ml.backend == "blf") else None
@@ -1812,9 +2017,39 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
             )
 
             total_frames = int(end_f_excl) - int(start_f)
+            cue_words = _count_words_for_reveal(cue.text)
+            cue_duration_ms = int(cue.end_ms) - int(cue.start_ms)
+            cue_density_wps = _cue_density_wps(words=cue_words, duration_ms=cue_duration_ms)
+            cue_speed = 1.0
+            reveal_frames = int(total_frames)
+            if auto_speed_enabled:
+                cue_speed = _compute_auto_reveal_speed_multiplier(
+                    words=cue_words,
+                    duration_ms=cue_duration_ms,
+                    baseline_wps=auto_baseline_wps,
+                    max_speedup=auto_max_speedup,
+                    gamma=auto_gamma,
+                )
+                reveal_frames = _compute_reveal_window_frames(total_frames=total_frames, speed=cue_speed)
+                print(
+                    "reveal_auto_speed "
+                    f"cue_idx={cue.idx} "
+                    f"words={cue_words} "
+                    f"duration_ms={cue_duration_ms} "
+                    f"density_wps={cue_density_wps:.3f} "
+                    f"baseline_wps={auto_baseline_wps:.3f} "
+                    f"speed={cue_speed:.3f} "
+                    f"reveal_frames={reveal_frames} "
+                    f"total_frames={total_frames}"
+                )
             for j, (wtxt, wx, wy) in enumerate(word_locs):
-                w_start = int(start_f) + (int(j) * int(total_frames)) // max(1, int(n_words))
-                w_start = max(int(start_f), min(int(w_start), int(end_f_excl) - 1))
+                w_start = _compute_word_reveal_start_frame(
+                    start_f=int(start_f),
+                    end_f_excl=int(end_f_excl),
+                    reveal_frames=int(reveal_frames),
+                    n_words=int(n_words),
+                    word_index=int(j),
+                )
                 w_end_excl = int(end_f_excl)
 
                 ch = int(base_word_ch) + int(j)
@@ -1987,6 +2222,24 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
                     hide_alpha_only(visible)
                     occupied.setdefault(int(blur_ch), []).append((int(start_f), int(end_f_excl)))
 
+    song_title = str(getattr(args, "song_title", "") or "").strip()
+    if song_title:
+        song_font_size = max(1, int(round(float(p["font_size"]) * 0.60)))
+        add_song_title_overlay(
+            scene,
+            title=song_title,
+            frame_start=1,
+            frame_end_excl=int(end_excl),
+            preferred_channel=int(base_text_ch),
+            font_path=str(p["font_path"]) if p["font_path"] else "",
+            font_size=song_font_size,
+            safe_margin=float(safe_margin),
+            text_rgb=text_rgb,
+            text_alpha=text_alpha,
+            outline=int(p["outline"]),
+            shadow=int(p["shadow"]),
+        )
+
     scene.frame_start = 1
     scene.frame_end = int(end_excl) - 1
     scene.render.filepath = str(Path(args.output).expanduser().resolve())
@@ -2018,6 +2271,17 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--text-channel", type=int, default=10)
     ap.add_argument("--preset", default="sub_basic")
     ap.add_argument("--bg-mode", dest="bg_mode", default=None, choices=["none", "full", "per_cue"])
+    ap.add_argument(
+        "--song-title",
+        default="",
+        help="Optional static song title rendered at top-center for the full video duration.",
+    )
+    ap.add_argument(
+        "--auto-baseline-wps",
+        type=float,
+        default=0.0,
+        help="Optional override for reveal.auto_speed baseline words/second. 0 disables override.",
+    )
     ap.add_argument("--output", required=True)
     ap.add_argument("--ffmpeg-format", default="MPEG4")
     ap.add_argument("--vcodec", default="H264")

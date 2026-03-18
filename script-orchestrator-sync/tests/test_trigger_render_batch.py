@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 from pathlib import Path
 
@@ -67,3 +68,51 @@ def test_compute_queue_progress_empty_targets_is_complete() -> None:
     assert snapshot["total_jobs"] == 0
     assert snapshot["done_jobs"] == 0
     assert snapshot["percent"] == 100.0
+
+
+def test_is_stale_active_job_for_running_age_threshold() -> None:
+    now = dt.datetime(2026, 3, 17, 12, 0, 0, tzinfo=dt.timezone.utc)
+    row = {
+        "enabled": "TRUE",
+        "status": "running",
+        "updated_utc": "2026-03-17T11:20:00+00:00",
+    }
+    assert trigger._is_stale_active_job(row, now_utc=now, stale_seconds=1800.0) is True
+
+
+def test_is_stale_active_job_for_unexpired_lease() -> None:
+    now = dt.datetime(2026, 3, 17, 12, 0, 0, tzinfo=dt.timezone.utc)
+    row = {
+        "enabled": "TRUE",
+        "status": "leased",
+        "updated_utc": "2026-03-17T11:58:00+00:00",
+        "lease_until_utc": "2026-03-17T12:05:00+00:00",
+    }
+    assert trigger._is_stale_active_job(row, now_utc=now, stale_seconds=1800.0) is False
+
+
+def test_find_stale_active_jobs_filters_only_stale_rows() -> None:
+    now = dt.datetime(2026, 3, 17, 12, 0, 0, tzinfo=dt.timezone.utc)
+    rows = [
+        {
+            "render_job_id": "job_stale_running",
+            "enabled": "TRUE",
+            "status": "running",
+            "updated_utc": "2026-03-17T11:00:00+00:00",
+        },
+        {
+            "render_job_id": "job_stale_lease",
+            "enabled": "TRUE",
+            "status": "leased",
+            "updated_utc": "2026-03-17T11:50:00+00:00",
+            "lease_until_utc": "2026-03-17T11:55:00+00:00",
+        },
+        {
+            "render_job_id": "job_fresh",
+            "enabled": "TRUE",
+            "status": "running",
+            "updated_utc": "2026-03-17T11:59:00+00:00",
+        },
+    ]
+    stale = trigger.find_stale_active_jobs(rows, now_utc=now, stale_seconds=1800.0)
+    assert [row["render_job_id"] for row in stale] == ["job_stale_running", "job_stale_lease"]

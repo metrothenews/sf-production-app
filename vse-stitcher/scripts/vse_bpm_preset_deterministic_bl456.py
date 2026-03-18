@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import random
 import re
 import shutil
@@ -11,7 +12,7 @@ import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import bpy
 
@@ -96,6 +97,26 @@ def clear_vse(scene: bpy.types.Scene, *, best_effort: bool = False) -> None:
 class Step:
     rate: int
     category: str
+    modifier: str = ""
+
+
+@dataclass(frozen=True)
+class SegmentPlan:
+    segment_index: int
+    timeline_start_frame: int
+    timeline_end_frame_exclusive: int
+    category: str
+    modifier: str
+    mode: str
+    primary_clip_path: str
+    secondary_clip_path: str
+    primary_in_start: int
+    secondary_in_start: int
+    fallback_applied: bool
+    fallback_reason: str
+
+
+ALLOWED_STEP_MODIFIERS = {"", "b", "w", "s", "sb", "sw"}
 
 
 def parse_preset(preset: str) -> List[Step]:
@@ -119,12 +140,216 @@ def parse_preset(preset: str) -> List[Step]:
         n, j = read_int(i)
         if j >= len(s):
             raise ValueError(f"Missing category letter after digits at position {i} in preset: {preset!r}")
-        cat = s[j]
-        if not cat.isalpha():
+        k = j
+        while k < len(s) and s[k].isalpha():
+            k += 1
+        if k == j:
             raise ValueError(f"Expected category letter at position {j} in preset: {preset!r}")
-        out.append(Step(rate=n, category=cat))
-        i = j + 1
+        suffix = s[j:k]
+        cat = suffix[-1]
+        modifier = suffix[:-1].lower()
+        if modifier not in ALLOWED_STEP_MODIFIERS:
+            token = s[i:k]
+            raise ValueError(
+                f"Unsupported modifier '{modifier}' in token '{token}' at position {i} in preset: {preset!r}. "
+                f"Allowed modifiers={sorted(ALLOWED_STEP_MODIFIERS)}"
+            )
+        out.append(Step(rate=n, category=cat, modifier=modifier))
+        i = k
     return out
+
+
+def _step_mode_from_modifier(modifier: str) -> str:
+    mod = str(modifier or "").strip().lower()
+    mapping = {
+        "": "normal",
+        "b": "flash_black",
+        "w": "flash_white",
+        "s": "stutter_two",
+        "sb": "stutter_black",
+        "sw": "stutter_white",
+    }
+    if mod not in mapping:
+        raise ValueError(f"Unsupported step modifier: {modifier!r}")
+    return mapping[mod]
+
+
+def _choose_initial_in_start(
+    *,
+    rng: random.Random,
+    source_frames: int,
+    segment_len: int,
+    random_inpoints: bool,
+    fit_segment: bool,
+) -> int:
+    src = max(1, int(source_frames))
+    seg = max(1, int(segment_len))
+    if not random_inpoints or src <= 1:
+        return 0
+    if fit_segment and src > seg:
+        max_start = src - seg
+        return rng.randrange(0, max_start + 1) if max_start > 0 else 0
+    return rng.randrange(0, src)
+
+
+def _build_frame_ops_for_segment(
+    *,
+    segment_index: int,
+    mode: str,
+    start: int,
+    end_excl: int,
+    primary_clip_path: str,
+    secondary_clip_path: str,
+    primary_source_frames: int,
+    secondary_source_frames: int,
+    primary_in_start: int,
+    secondary_in_start: int,
+) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    start_i = int(start)
+    end_i = int(end_excl)
+    if end_i <= start_i:
+        return ops
+
+    if mode == "flash_black":
+        ops.append(
+            {
+                "timeline_frame": start_i,
+                "op_type": "replace_color",
+                "color": "black",
+                "source_role": "",
+                "source_clip_path": "",
+                "source_frame": -1,
+                "segment_index": int(segment_index),
+            }
+        )
+        return ops
+    if mode == "flash_white":
+        ops.append(
+            {
+                "timeline_frame": start_i,
+                "op_type": "replace_color",
+                "color": "white",
+                "source_role": "",
+                "source_clip_path": "",
+                "source_frame": -1,
+                "segment_index": int(segment_index),
+            }
+        )
+        return ops
+
+    if mode == "stutter_black":
+        src = max(1, int(primary_source_frames))
+        pos = int(primary_in_start)
+        for rel, frame in enumerate(range(start_i, end_i)):
+            if stutter_uses_primary_source(rel):
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_color",
+                        "color": "black",
+                        "source_role": "",
+                        "source_clip_path": "",
+                        "source_frame": -1,
+                        "segment_index": int(segment_index),
+                    }
+                )
+            else:
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_source",
+                        "color": "",
+                        "source_role": "primary",
+                        "source_clip_path": str(primary_clip_path),
+                        "source_frame": int(pos % src),
+                        "segment_index": int(segment_index),
+                    }
+                )
+                pos += 1
+        return ops
+
+    if mode == "stutter_white":
+        src = max(1, int(primary_source_frames))
+        pos = int(primary_in_start)
+        for rel, frame in enumerate(range(start_i, end_i)):
+            if stutter_uses_primary_source(rel):
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_color",
+                        "color": "white",
+                        "source_role": "",
+                        "source_clip_path": "",
+                        "source_frame": -1,
+                        "segment_index": int(segment_index),
+                    }
+                )
+            else:
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_source",
+                        "color": "",
+                        "source_role": "primary",
+                        "source_clip_path": str(primary_clip_path),
+                        "source_frame": int(pos % src),
+                        "segment_index": int(segment_index),
+                    }
+                )
+                pos += 1
+        return ops
+
+    if mode == "stutter_two":
+        if not secondary_clip_path:
+            return ops
+        src_a = max(1, int(primary_source_frames))
+        src_b = max(1, int(secondary_source_frames))
+        pos_a = int(primary_in_start)
+        pos_b = int(secondary_in_start)
+        for rel, frame in enumerate(range(start_i, end_i)):
+            if stutter_uses_primary_source(rel):
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_source",
+                        "color": "",
+                        "source_role": "primary",
+                        "source_clip_path": str(primary_clip_path),
+                        "source_frame": int(pos_a % src_a),
+                        "segment_index": int(segment_index),
+                    }
+                )
+                pos_a += 1
+            else:
+                ops.append(
+                    {
+                        "timeline_frame": int(frame),
+                        "op_type": "replace_source",
+                        "color": "",
+                        "source_role": "secondary",
+                        "source_clip_path": str(secondary_clip_path),
+                        "source_frame": int(pos_b % src_b),
+                        "segment_index": int(segment_index),
+                    }
+                )
+                pos_b += 1
+        return ops
+
+    return ops
+
+
+def _validate_unique_frame_ops(frame_ops: Sequence[Dict[str, Any]]) -> None:
+    seen: Dict[int, Dict[str, Any]] = {}
+    for op in frame_ops:
+        frame = int(op.get("timeline_frame", -1))
+        if frame in seen:
+            prev = seen[frame]
+            raise RuntimeError(
+                "Duplicate frame op detected "
+                f"timeline_frame={frame} prev={prev} next={op}"
+            )
+        seen[frame] = dict(op)
 
 
 # ----------------------------
@@ -330,6 +555,94 @@ def add_movie(scene: bpy.types.Scene, filepath: str, *, channel: int, frame_star
     )
 
 
+def add_color_frame(
+    scene: bpy.types.Scene,
+    *,
+    channel: int,
+    frame_start: int,
+    rgb: Tuple[float, float, float],
+) -> bpy.types.Sequence:
+    se = _ensure_sequence_editor(scene)
+    coll = _strips_collection(se)
+    kwargs = {
+        "name": f"FLASH_{int(frame_start)}",
+        "type": "COLOR",
+        "channel": int(channel),
+        "frame_start": int(frame_start),
+        "frame_end": int(frame_start) + 1,
+    }
+    try:
+        strip = coll.new_effect(**kwargs)
+    except TypeError:
+        strip = coll.new_effect(seq1=None, seq2=None, **kwargs)
+    if hasattr(strip, "color"):
+        try:
+            strip.color = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+        except Exception:
+            pass
+    _set_color_window(strip, int(frame_start), int(frame_start) + 1)
+    _ensure_exact_window_or_raise(
+        strip,
+        start=int(frame_start),
+        end_excl=int(frame_start) + 1,
+        context="add_color_frame",
+    )
+    return strip
+
+
+def _set_strip_extension_knobs_zero(strip: bpy.types.Sequence) -> None:
+    for attr in (
+        "frame_still_start",
+        "frame_still_end",
+        "animation_offset_start",
+        "animation_offset_end",
+    ):
+        if hasattr(strip, attr):
+            try:
+                setattr(strip, attr, 0)
+            except Exception:
+                pass
+
+
+def _set_color_window(strip: bpy.types.Sequence, start: int, end_excl: int) -> None:
+    strip.frame_start = int(start)
+    if hasattr(strip, "frame_end"):
+        try:
+            strip.frame_end = int(end_excl)
+        except Exception:
+            pass
+    _set_strip_extension_knobs_zero(strip)
+
+
+def strip_final_window(strip: bpy.types.Sequence) -> Tuple[int, int]:
+    start = int(getattr(strip, "frame_final_start", getattr(strip, "frame_start", 0)))
+    dur = int(getattr(strip, "frame_final_duration", getattr(strip, "frame_duration", 0)))
+    dur = max(0, dur)
+    return start, start + dur
+
+
+def strip_window_matches(strip: bpy.types.Sequence, *, start: int, end_excl: int) -> bool:
+    got_start, got_end_excl = strip_final_window(strip)
+    return got_start == int(start) and got_end_excl == int(end_excl)
+
+
+def _ensure_exact_window_or_raise(
+    strip: bpy.types.Sequence,
+    *,
+    start: int,
+    end_excl: int,
+    context: str,
+) -> None:
+    if strip_window_matches(strip, start=int(start), end_excl=int(end_excl)):
+        return
+    got_start, got_end_excl = strip_final_window(strip)
+    raise RuntimeError(
+        "Strip window mismatch "
+        f"context={context} strip={getattr(strip, 'name', '<unnamed>')!r} "
+        f"expected=[{int(start)},{int(end_excl)}) got=[{got_start},{got_end_excl})"
+    )
+
+
 def strip_source_frames(strip: bpy.types.Sequence) -> int:
     dur = int(getattr(strip, "frame_final_duration", 0))
     if dur <= 0:
@@ -337,28 +650,108 @@ def strip_source_frames(strip: bpy.types.Sequence) -> int:
     return dur
 
 
+def strip_stable_source_frames(strip: bpy.types.Sequence) -> int:
+    """Return the immutable source frame length for trim math."""
+    dur = int(getattr(strip, "frame_duration", 0))
+    if dur <= 0:
+        dur = int(getattr(strip, "frame_final_duration", 0))
+    return int(dur)
+
+
+def _compute_timeline_anchored_window(
+    *,
+    start: int,
+    end_excl: int,
+    in_start: int,
+    source_total: int,
+) -> Tuple[int, int, int, int]:
+    src_total = int(source_total)
+    if src_total <= 0:
+        raise RuntimeError(f"Invalid source_total={source_total} for strip windowing.")
+    req_len = max(1, int(end_excl) - int(start))
+    off_start = max(0, int(in_start))
+    if off_start >= src_total:
+        off_start = max(0, src_total - 1)
+    max_visible = max(1, src_total - off_start)
+    visible_len = min(req_len, max_visible)
+    off_end = max(0, (src_total - off_start) - visible_len)
+    frame_start = int(start) - off_start
+    return (int(frame_start), int(off_start), int(off_end), int(visible_len))
+
+
 def set_strip_window(strip: bpy.types.Sequence, start: int, end_excl: int, *, in_start: int = 0) -> None:
     """
     Make this strip cover exactly [start, end_excl) (or less if the source is shorter),
     starting the strip content at in_start frames into the source.
     """
-    strip.frame_start = int(start)
-    if hasattr(strip, "frame_offset_start"):
-        strip.frame_offset_start = max(0, int(in_start))
-
-    want = max(1, int(end_excl - start))
-    src = strip_source_frames(strip)
-    if src <= 0:
+    _set_strip_extension_knobs_zero(strip)
+    src_total = strip_stable_source_frames(strip)
+    if src_total <= 0:
         raise RuntimeError(f"Unknown duration for strip '{strip.name}'.")
-
-    off_start = int(getattr(strip, "frame_offset_start", 0))
-    max_visible = max(1, src - off_start)
-    if want > max_visible:
-        want = max_visible
-
-    off_end = max(0, (src - off_start) - want)
+    frame_start, off_start, off_end, _ = _compute_timeline_anchored_window(
+        start=int(start),
+        end_excl=int(end_excl),
+        in_start=int(in_start),
+        source_total=int(src_total),
+    )
+    strip.frame_start = int(frame_start)
+    if hasattr(strip, "frame_offset_start"):
+        strip.frame_offset_start = int(off_start)
     if hasattr(strip, "frame_offset_end"):
         strip.frame_offset_end = int(off_end)
+    _set_strip_extension_knobs_zero(strip)
+
+
+def add_movie_frame(
+    scene: bpy.types.Scene,
+    *,
+    filepath: str,
+    channel: int,
+    frame_start: int,
+    in_start: int,
+) -> bpy.types.Sequence:
+    strip = add_movie(scene, filepath, channel=int(channel), frame_start=int(frame_start))
+    mute_movie_audio(strip)
+    expected_start = int(frame_start)
+    expected_end_excl = int(frame_start) + 1
+    set_strip_window(strip, expected_start, expected_end_excl, in_start=int(in_start))
+    if not strip_window_matches(strip, start=expected_start, end_excl=expected_end_excl):
+        first_start, first_end = strip_final_window(strip)
+        first_dur = max(0, int(first_end) - int(first_start))
+        # One correction pass handles strips where still/animation offsets are reintroduced.
+        set_strip_window(strip, expected_start, expected_end_excl, in_start=int(in_start))
+        second_start, second_end = strip_final_window(strip)
+        second_dur = max(0, int(second_end) - int(second_start))
+        if second_dur > first_dur:
+            raise RuntimeError(
+                "Strip correction broadened window "
+                f"context=add_movie_frame strip={getattr(strip, 'name', '<unnamed>')!r} "
+                f"before=[{first_start},{first_end}) after=[{second_start},{second_end}) "
+                f"expected=[{expected_start},{expected_end_excl})"
+            )
+    _ensure_exact_window_or_raise(
+        strip,
+        start=expected_start,
+        end_excl=expected_end_excl,
+        context="add_movie_frame",
+    )
+    return strip
+
+
+def probe_movie_source_frames(scene: bpy.types.Scene, *, filepath: str, channel: int) -> int:
+    se = _ensure_sequence_editor(scene)
+    probe = add_movie(scene, filepath, channel=int(channel), frame_start=1)
+    try:
+        mute_movie_audio(probe)
+        src = strip_source_frames(probe)
+        if src <= 0:
+            raise RuntimeError(f"Unknown duration for strip '{probe.name}'.")
+        return int(src)
+    finally:
+        try:
+            _remove_strip(se, probe)
+        except Exception:
+            pass
 
 
 def tile_movie_to_fill(
@@ -425,6 +818,76 @@ def tile_movie_to_fill(
         first = False
 
 
+def stutter_uses_primary_source(rel_frame_index: int) -> bool:
+    return (int(rel_frame_index) % 2) == 0
+
+
+def render_stutter_two_clips(
+    scene: bpy.types.Scene,
+    *,
+    filepath_a: str,
+    filepath_b: str,
+    channel: int,
+    start: int,
+    end_excl: int,
+    rng: random.Random,
+    random_inpoints: bool,
+) -> None:
+    src_a = probe_movie_source_frames(scene, filepath=filepath_a, channel=int(channel))
+    src_b = probe_movie_source_frames(scene, filepath=filepath_b, channel=int(channel))
+    pos_a = rng.randrange(0, src_a) if random_inpoints and src_a > 1 else 0
+    pos_b = rng.randrange(0, src_b) if random_inpoints and src_b > 1 else 0
+
+    for rel, frame in enumerate(range(int(start), int(end_excl))):
+        use_a = stutter_uses_primary_source(rel)
+        if use_a:
+            add_movie_frame(
+                scene,
+                filepath=filepath_a,
+                channel=int(channel),
+                frame_start=int(frame),
+                in_start=int(pos_a % src_a),
+            )
+            pos_a += 1
+        else:
+            add_movie_frame(
+                scene,
+                filepath=filepath_b,
+                channel=int(channel),
+                frame_start=int(frame),
+                in_start=int(pos_b % src_b),
+            )
+            pos_b += 1
+
+
+def render_stutter_color_clip(
+    scene: bpy.types.Scene,
+    *,
+    filepath: str,
+    color_rgb: Tuple[float, float, float],
+    channel: int,
+    start: int,
+    end_excl: int,
+    rng: random.Random,
+    random_inpoints: bool,
+) -> None:
+    src = probe_movie_source_frames(scene, filepath=filepath, channel=int(channel))
+    pos = rng.randrange(0, src) if random_inpoints and src > 1 else 0
+
+    for rel, frame in enumerate(range(int(start), int(end_excl))):
+        if stutter_uses_primary_source(rel):
+            add_color_frame(scene, channel=int(channel), frame_start=int(frame), rgb=color_rgb)
+            continue
+        add_movie_frame(
+            scene,
+            filepath=filepath,
+            channel=int(channel),
+            frame_start=int(frame),
+            in_start=int(pos % src),
+        )
+        pos += 1
+
+
 # ----------------------------
 # Safety / cleanup helpers
 # ----------------------------
@@ -484,10 +947,54 @@ def assert_no_overlaps(scene: bpy.types.Scene) -> None:
             dur = int(getattr(s, "frame_final_duration", getattr(s, "frame_duration", 0)))
             end_excl = start + max(0, dur)
             if prev_end is not None and start < prev_end:
+                print(
+                    "overlap_diagnostics "
+                    f"channel={ch} strip={getattr(s, 'name', '<unnamed>')!r} strip_start={start} "
+                    f"prev_end={prev_end}"
+                )
                 raise RuntimeError(
                     f"Overlap detected on channel {ch}: '{s.name}' starts {start} < prev_end {prev_end}."
                 )
             prev_end = end_excl
+
+
+def _assert_no_overlaps_in_window(
+    scene: bpy.types.Scene,
+    *,
+    channel: int,
+    start: int,
+    end_excl: int,
+    mode: str,
+) -> None:
+    se = _ensure_sequence_editor(scene)
+    window = []
+    for s in _all_strips(se):
+        if int(getattr(s, "channel", 0)) != int(channel):
+            continue
+        s_start, s_end = strip_final_window(s)
+        if s_end <= int(start) or s_start >= int(end_excl):
+            continue
+        window.append((s_start, s_end, s))
+    window.sort(key=lambda x: (x[0], x[1], getattr(x[2], "name", "")))
+
+    prev_end: Optional[int] = None
+    prev_name = ""
+    for s_start, s_end, s in window:
+        if prev_end is not None and s_start < prev_end:
+            print(
+                "stutter_overlap_diagnostics "
+                f"mode={mode} channel={int(channel)} segment=[{int(start)},{int(end_excl)}) "
+                f"strip={getattr(s, 'name', '<unnamed>')!r} strip_start={s_start} prev_end={prev_end} "
+                f"prev_strip={prev_name!r}"
+            )
+            raise RuntimeError(
+                "Stutter segment overlap "
+                f"mode={mode} channel={int(channel)} segment=[{int(start)},{int(end_excl)}) "
+                f"strip={getattr(s, 'name', '<unnamed>')!r} strip_start={s_start} "
+                f"prev_strip={prev_name!r} prev_end={prev_end}"
+            )
+        prev_end = s_end
+        prev_name = str(getattr(s, "name", ""))
 
 
 # ----------------------------
@@ -512,6 +1019,39 @@ def pick_clip_from_pool(
         deck_state[key] = deck
     idx = deck.pop()
     return pool[idx]
+
+
+def pick_two_distinct_clips_from_pool(
+    pool: List[Path],
+    rng: random.Random,
+    *,
+    category: str,
+    deck_state: Dict[str, List[int]],
+    max_unique_tries: int,
+) -> Optional[Tuple[Path, Path]]:
+    unique = {str(p) for p in pool}
+    if len(unique) < 2:
+        return None
+
+    first = pick_clip_from_pool(
+        pool,
+        rng,
+        category=category,
+        deck_state=deck_state,
+        max_unique_tries=max_unique_tries,
+    )
+    tries = max(2, int(max_unique_tries), len(pool) * 2)
+    for _ in range(tries):
+        second = pick_clip_from_pool(
+            pool,
+            rng,
+            category=category,
+            deck_state=deck_state,
+            max_unique_tries=max_unique_tries,
+        )
+        if second != first:
+            return (first, second)
+    return None
 
 
 def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
@@ -564,11 +1104,17 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
     category_decks: Dict[str, List[int]] = {}
 
     cache_dir = Path(args.cache_dir).expanduser().resolve()
+    pass1_mode = str(getattr(args, "effects_pass1_mode", "legacy") or "legacy").strip().lower()
+    pass1_base_only = pass1_mode == "base_only"
+    segments_payload: List[SegmentPlan] = []
+    frame_ops_payload: List[Dict[str, Any]] = []
+    warnings_payload: List[str] = []
 
     while cursor < audio_end_excl:
         step = steps[idx]
         cuts = int(step.rate)
         cat = step.category.upper()
+        mode = _step_mode_from_modifier(step.modifier)
 
         if cuts <= 0:
             raise RuntimeError(f"Invalid cut rate {cuts} in preset step: {step}")
@@ -583,27 +1129,255 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
 
         start = cursor
         end_excl = min(audio_end_excl, start + seg_len_i)
-
-        clip_path = pick_clip_from_pool(
-            pools[cat],
-            rng,
-            category=cat,
-            deck_state=category_decks,
-            max_unique_tries=int(args.max_unique_tries),
+        seg_len = max(1, int(end_excl - start))
+        print(
+            "segment_planned "
+            f"segment_index={int(len(segments_payload))} category={cat} modifier={step.modifier!r} "
+            f"mode={mode} segment_frames={seg_len} timeline_start={start} timeline_end_excl={end_excl}"
         )
-        inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
 
-        # FIX: loop/tile short clips to fill the entire allotted window (prevents dips to black)
-        tile_movie_to_fill(
-            scene,
-            filepath=str(inter),
-            channel=int(args.video_channel),
-            start=int(start),
-            end_excl=int(end_excl),
-            rng=rng,
-            random_inpoints=bool(args.random_inpoints),
-            max_tiles=int(args.max_segments_per_cut),
-        )
+        if pass1_base_only:
+            primary_clip = pick_clip_from_pool(
+                pools[cat],
+                rng,
+                category=cat,
+                deck_state=category_decks,
+                max_unique_tries=int(args.max_unique_tries),
+            )
+            secondary_clip: Optional[Path] = None
+            fallback_applied = False
+            fallback_reason = ""
+            effective_mode = mode
+
+            if mode == "stutter_two":
+                pair = pick_two_distinct_clips_from_pool(
+                    pools[cat],
+                    rng,
+                    category=cat,
+                    deck_state=category_decks,
+                    max_unique_tries=int(args.max_unique_tries),
+                )
+                if pair is None:
+                    effective_mode = "normal"
+                    fallback_applied = True
+                    fallback_reason = "insufficient_unique_clips"
+                    warning = (
+                        "stutter_fallback=normal "
+                        f"category={cat} reason={fallback_reason} segment_start={start} segment_end={end_excl}"
+                    )
+                    print(warning)
+                    warnings_payload.append(warning)
+                else:
+                    primary_clip = pair[0]
+                    secondary_clip = pair[1]
+
+            primary_inter = transcode_to_intermediate(primary_clip, cache_dir, fps=int(args.fps))
+            secondary_inter = (
+                transcode_to_intermediate(secondary_clip, cache_dir, fps=int(args.fps))
+                if secondary_clip is not None
+                else None
+            )
+
+            primary_src_frames = probe_movie_source_frames(
+                scene,
+                filepath=str(primary_inter),
+                channel=int(args.video_channel),
+            )
+            secondary_src_frames = (
+                probe_movie_source_frames(
+                    scene,
+                    filepath=str(secondary_inter),
+                    channel=int(args.video_channel),
+                )
+                if secondary_inter is not None
+                else 0
+            )
+
+            primary_in_start = _choose_initial_in_start(
+                rng=rng,
+                source_frames=int(primary_src_frames),
+                segment_len=int(seg_len),
+                random_inpoints=bool(args.random_inpoints),
+                fit_segment=bool(effective_mode in {"normal", "flash_black", "flash_white"}),
+            )
+            secondary_in_start = _choose_initial_in_start(
+                rng=rng,
+                source_frames=int(secondary_src_frames) if secondary_src_frames > 0 else 1,
+                segment_len=int(seg_len),
+                random_inpoints=bool(args.random_inpoints),
+                fit_segment=False,
+            )
+            if secondary_inter is None:
+                secondary_in_start = 0
+
+            segment = SegmentPlan(
+                segment_index=int(len(segments_payload)),
+                timeline_start_frame=int(start),
+                timeline_end_frame_exclusive=int(end_excl),
+                category=str(cat),
+                modifier=str(step.modifier or ""),
+                mode=str(effective_mode),
+                primary_clip_path=str(primary_inter),
+                secondary_clip_path=str(secondary_inter or ""),
+                primary_in_start=int(primary_in_start),
+                secondary_in_start=int(secondary_in_start),
+                fallback_applied=bool(fallback_applied),
+                fallback_reason=str(fallback_reason),
+            )
+            segments_payload.append(segment)
+            print(
+                "segment_mode "
+                f"segment_index={int(segment.segment_index)} mode={effective_mode} "
+                f"primary_clip={segment.primary_clip_path!r} secondary_clip={segment.secondary_clip_path!r} "
+                f"primary_in_start={int(segment.primary_in_start)} secondary_in_start={int(segment.secondary_in_start)}"
+            )
+            frame_ops_payload.extend(
+                _build_frame_ops_for_segment(
+                    segment_index=int(segment.segment_index),
+                    mode=str(effective_mode),
+                    start=int(start),
+                    end_excl=int(end_excl),
+                    primary_clip_path=str(primary_inter),
+                    secondary_clip_path=str(secondary_inter or ""),
+                    primary_source_frames=int(primary_src_frames),
+                    secondary_source_frames=int(secondary_src_frames),
+                    primary_in_start=int(primary_in_start),
+                    secondary_in_start=int(secondary_in_start),
+                )
+            )
+
+            # Pass1 base render ignores modifiers and always fills the segment with primary media.
+            tile_movie_to_fill(
+                scene,
+                filepath=str(primary_inter),
+                channel=int(args.video_channel),
+                start=int(start),
+                end_excl=int(end_excl),
+                rng=rng,
+                random_inpoints=bool(args.random_inpoints),
+                max_tiles=int(args.max_segments_per_cut),
+            )
+        else:
+            # Legacy mode applies modifiers directly during stitch pass.
+            if mode == "normal":
+                clip_path = pick_clip_from_pool(
+                    pools[cat],
+                    rng,
+                    category=cat,
+                    deck_state=category_decks,
+                    max_unique_tries=int(args.max_unique_tries),
+                )
+                inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
+                tile_movie_to_fill(
+                    scene,
+                    filepath=str(inter),
+                    channel=int(args.video_channel),
+                    start=int(start),
+                    end_excl=int(end_excl),
+                    rng=rng,
+                    random_inpoints=bool(args.random_inpoints),
+                    max_tiles=int(args.max_segments_per_cut),
+                )
+            elif mode in {"flash_black", "flash_white"}:
+                clip_path = pick_clip_from_pool(
+                    pools[cat],
+                    rng,
+                    category=cat,
+                    deck_state=category_decks,
+                    max_unique_tries=int(args.max_unique_tries),
+                )
+                inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
+                rgb = (0.0, 0.0, 0.0) if mode == "flash_black" else (1.0, 1.0, 1.0)
+                add_color_frame(scene, channel=int(args.video_channel), frame_start=int(start), rgb=rgb)
+                if int(end_excl) - int(start) > 1:
+                    tile_movie_to_fill(
+                        scene,
+                        filepath=str(inter),
+                        channel=int(args.video_channel),
+                        start=int(start) + 1,
+                        end_excl=int(end_excl),
+                        rng=rng,
+                        random_inpoints=bool(args.random_inpoints),
+                        max_tiles=int(args.max_segments_per_cut),
+                    )
+            elif mode == "stutter_two":
+                pair = pick_two_distinct_clips_from_pool(
+                    pools[cat],
+                    rng,
+                    category=cat,
+                    deck_state=category_decks,
+                    max_unique_tries=int(args.max_unique_tries),
+                )
+                if pair is None:
+                    print(
+                        "stutter_fallback=normal "
+                        f"category={cat} reason=insufficient_unique_clips segment_start={start} segment_end={end_excl}"
+                    )
+                    clip_path = pick_clip_from_pool(
+                        pools[cat],
+                        rng,
+                        category=cat,
+                        deck_state=category_decks,
+                        max_unique_tries=int(args.max_unique_tries),
+                    )
+                    inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
+                    tile_movie_to_fill(
+                        scene,
+                        filepath=str(inter),
+                        channel=int(args.video_channel),
+                        start=int(start),
+                        end_excl=int(end_excl),
+                        rng=rng,
+                        random_inpoints=bool(args.random_inpoints),
+                        max_tiles=int(args.max_segments_per_cut),
+                    )
+                else:
+                    inter_a = transcode_to_intermediate(pair[0], cache_dir, fps=int(args.fps))
+                    inter_b = transcode_to_intermediate(pair[1], cache_dir, fps=int(args.fps))
+                    render_stutter_two_clips(
+                        scene,
+                        filepath_a=str(inter_a),
+                        filepath_b=str(inter_b),
+                        channel=int(args.video_channel),
+                        start=int(start),
+                        end_excl=int(end_excl),
+                        rng=rng,
+                        random_inpoints=bool(args.random_inpoints),
+                    )
+                    _assert_no_overlaps_in_window(
+                        scene,
+                        channel=int(args.video_channel),
+                        start=int(start),
+                        end_excl=int(end_excl),
+                        mode="stutter_two",
+                    )
+            else:
+                clip_path = pick_clip_from_pool(
+                    pools[cat],
+                    rng,
+                    category=cat,
+                    deck_state=category_decks,
+                    max_unique_tries=int(args.max_unique_tries),
+                )
+                inter = transcode_to_intermediate(clip_path, cache_dir, fps=int(args.fps))
+                rgb = (0.0, 0.0, 0.0) if mode == "stutter_black" else (1.0, 1.0, 1.0)
+                render_stutter_color_clip(
+                    scene,
+                    filepath=str(inter),
+                    color_rgb=rgb,
+                    channel=int(args.video_channel),
+                    start=int(start),
+                    end_excl=int(end_excl),
+                    rng=rng,
+                    random_inpoints=bool(args.random_inpoints),
+                )
+                _assert_no_overlaps_in_window(
+                    scene,
+                    channel=int(args.video_channel),
+                    start=int(start),
+                    end_excl=int(end_excl),
+                    mode=mode,
+                )
 
         # Clean up any imported audio from any of the created movie strips
         remove_non_master_audio(scene, preserve_aux=bool(args.preserve_aux_audio), master_audio_path=str(audio_path))
@@ -643,6 +1417,48 @@ def build_timeline(args: argparse.Namespace) -> bpy.types.Scene:
         scene["_stitch_output_path"] = str(out_path)
         scene["_stitch_audio_path"] = str(audio_path)
         scene["_stitch_fps"] = int(args.fps)
+
+    effects_plan_out = str(getattr(args, "effects_plan_out", "") or "").strip()
+    if effects_plan_out:
+        if not pass1_base_only:
+            raise RuntimeError("--effects-plan-out requires --effects-pass1-mode=base_only.")
+        _validate_unique_frame_ops(frame_ops_payload)
+        payload = {
+            "version": 1,
+            "run_id": str(getattr(args, "run_id", "") or ""),
+            "cut_idx": int(getattr(args, "cut_idx", 0) or 0),
+            "preset_raw": str(args.preset),
+            "seed": int(args.seed),
+            "fps": int(args.fps),
+            "render_end_frame_exclusive": int(audio_end_excl),
+            "base_video_path": str(Path(args.output).expanduser().resolve()) if str(args.output or "").strip() else "",
+            "segments": [
+                {
+                    "segment_index": int(s.segment_index),
+                    "timeline_start_frame": int(s.timeline_start_frame),
+                    "timeline_end_frame_exclusive": int(s.timeline_end_frame_exclusive),
+                    "category": str(s.category),
+                    "modifier": str(s.modifier),
+                    "mode": str(s.mode),
+                    "primary_clip_path": str(s.primary_clip_path),
+                    "secondary_clip_path": str(s.secondary_clip_path),
+                    "primary_in_start": int(s.primary_in_start),
+                    "secondary_in_start": int(s.secondary_in_start),
+                    "fallback_applied": bool(s.fallback_applied),
+                    "fallback_reason": str(s.fallback_reason),
+                }
+                for s in segments_payload
+            ],
+            "frame_ops": list(frame_ops_payload),
+            "warnings": list(warnings_payload),
+        }
+        plan_path = Path(effects_plan_out).expanduser().resolve()
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        print(
+            "effects_plan_written "
+            f"path={plan_path} segments={len(segments_payload)} frame_ops={len(frame_ops_payload)}"
+        )
 
     assert_no_overlaps(scene)
     return scene
@@ -764,6 +1580,8 @@ def main(argv: List[str]) -> int:
         help="Optional cap for stitch render duration in seconds from frame 1. 0 disables cap.",
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--run-id", default="")
+    ap.add_argument("--cut-idx", type=int, default=0)
     ap.add_argument("--scene", default="")
     ap.add_argument("--best-effort", action="store_true")
     ap.add_argument("--random-inpoints", action="store_true")
@@ -788,6 +1606,13 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--vcodec", default="H264")
     ap.add_argument("--acodec", default="AAC")
     ap.add_argument("--cache-dir", default="~/.vse_stitcher_cache")
+    ap.add_argument("--effects-plan-out", default="")
+    ap.add_argument(
+        "--effects-pass1-mode",
+        default="legacy",
+        choices=["legacy", "base_only"],
+        help="legacy=apply modifiers in stitch pass; base_only=ignore modifiers and emit plan for pass2.",
+    )
 
     args = ap.parse_args(argv)
 

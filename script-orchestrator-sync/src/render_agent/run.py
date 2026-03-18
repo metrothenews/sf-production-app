@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from so_sync.gateway import SheetsGateway
+from so_sync.drive_upload import DriveUploadError
 from so_sync.render_contract import (
     RENDER_CANONICAL_HEADERS,
     RENDER_HEADER_ALIASES,
@@ -180,6 +181,81 @@ def _safe_name(name: str) -> str:
     return "".join(c if (c.isalnum() or c in {"-", "_", "."}) else "_" for c in str(name))
 
 
+def _upload_verify_mode() -> str:
+    return str(os.environ.get("PIPELINE_UPLOAD_VERIFY_MODE", "size") or "size").strip().lower()
+
+
+def _cleanup_on_success_enabled() -> bool:
+    return str(os.environ.get("PIPELINE_LOCAL_CLEANUP_ON_SUCCESS", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _cleanup_on_failure_mode() -> str:
+    return str(os.environ.get("PIPELINE_LOCAL_CLEANUP_ON_FAILURE", "logs_only") or "logs_only").strip().lower()
+
+
+def _delete_local_path_best_effort(path: Path) -> None:
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as exc:
+        print(json.dumps({"event": "local_cleanup_skip", "path": str(path), "error": str(exc)}, sort_keys=True))
+
+
+def _prune_run_dir_keep_logs(run_dir: Path) -> None:
+    logs_dir = run_dir / "logs"
+    logs_resolved = logs_dir.resolve() if logs_dir.exists() else None
+    for child in run_dir.iterdir():
+        if logs_resolved and child.resolve() == logs_resolved:
+            continue
+        _delete_local_path_best_effort(child)
+
+
+def _cleanup_run_dir(run_dir: Path, *, success: bool) -> None:
+    if not run_dir.exists():
+        return
+    if success:
+        if not _cleanup_on_success_enabled():
+            return
+        _delete_local_path_best_effort(run_dir)
+        return
+    mode = _cleanup_on_failure_mode()
+    if mode in {"none", "off", "false", "0"}:
+        return
+    if mode == "logs_only":
+        _prune_run_dir_keep_logs(run_dir)
+        return
+    _delete_local_path_best_effort(run_dir)
+
+
+def _upload_confirm_and_delete_local(local_path: str, output_folder_id: str) -> dict[str, Any]:
+    path = Path(local_path)
+    if not path.exists():
+        raise RuntimeError(f"output file missing before upload: {local_path}")
+    expected_bytes = path.stat().st_size
+    meta = upload_file_to_folder(local_path, output_folder_id)
+    file_id = str(meta.get("file_id") or "").strip()
+    if not file_id:
+        raise RuntimeError(f"upload response missing file_id for local_path={local_path}")
+    verify_mode = _upload_verify_mode()
+    if verify_mode != "size":
+        raise RuntimeError(f"Unsupported PIPELINE_UPLOAD_VERIFY_MODE: {verify_mode}")
+    drive_client = drive_upload_from_env()
+    try:
+        drive_client.confirm_upload_size(file_id, expected_bytes)
+    except DriveUploadError as exc:
+        raise RuntimeError(str(exc)) from exc
+    _delete_local_path_best_effort(path)
+    meta["bytes"] = expected_bytes
+    return meta
+
+
 def _write_inputs_manifest(run_dir: Path, manifest_rows: list[dict[str, Any]]) -> str:
     path = run_dir / "inputs_manifest.json"
     path.write_text(json.dumps(manifest_rows, indent=2), encoding="utf-8")
@@ -334,37 +410,42 @@ def _run_selected_job(job: dict[str, Any], *, leased: bool) -> int:
     selected = select_k(pool, target_count, mode, seed)
     run_dir = Path("work") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    input_paths, _ = _download_selected(selected, run_dir)
-    outputs = render_outputs(job, input_paths, run_dir)
-    output_folder_id = resolve_output_folder_id(job.get("output_folder_id") or job.get("output_drive_folder_id") or "")
-    output_folder_id = output_folder_id or DEFAULT_OUTPUT_FOLDER_ID
+    run_success = False
     try:
-        ensure_folder_accessible(output_folder_id)
-    except Exception as exc:
-        raise _drive_api_error(
-            "output folder not writable by local identity (this is NOT proxy SA)",
-            exc,
-        ) from exc
-    uploaded: list[dict[str, Any]] = []
-    for out_path in outputs:
-        meta = upload_file_to_folder(out_path, output_folder_id)
-        meta["folder_id"] = output_folder_id
-        uploaded.append(meta)
-    finished = _utc_now_iso()
-    if leased:
-        mark_job_success(job_id, run_id, uploaded, finished)
-    print(
-        json.dumps(
-            {
-                "job_id": job_id,
-                "run_id": run_id,
-                "selected_count": len(selected),
-                "uploaded": uploaded,
-            },
-            sort_keys=True,
+        input_paths, _ = _download_selected(selected, run_dir)
+        outputs = render_outputs(job, input_paths, run_dir)
+        output_folder_id = resolve_output_folder_id(job.get("output_folder_id") or job.get("output_drive_folder_id") or "")
+        output_folder_id = output_folder_id or DEFAULT_OUTPUT_FOLDER_ID
+        try:
+            ensure_folder_accessible(output_folder_id)
+        except Exception as exc:
+            raise _drive_api_error(
+                "output folder not writable by local identity (this is NOT proxy SA)",
+                exc,
+            ) from exc
+        uploaded: list[dict[str, Any]] = []
+        for out_path in outputs:
+            meta = _upload_confirm_and_delete_local(out_path, output_folder_id)
+            meta["folder_id"] = output_folder_id
+            uploaded.append(meta)
+        finished = _utc_now_iso()
+        if leased:
+            mark_job_success(job_id, run_id, uploaded, finished)
+        print(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "selected_count": len(selected),
+                    "uploaded": uploaded,
+                },
+                sort_keys=True,
+            )
         )
-    )
-    return 0
+        run_success = True
+        return 0
+    finally:
+        _cleanup_run_dir(run_dir, success=run_success)
 
 
 def main() -> int:
