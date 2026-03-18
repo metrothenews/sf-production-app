@@ -5,8 +5,9 @@ BASE_URL_DEFAULT := https://YOUR-SHEETS-JSON-GATEWAY.a.run.app
 REPO_DIR := $(CURDIR)
 COMPOSE ?= docker compose
 COMPOSE_PROD := $(COMPOSE) -f docker-compose.prod.yml
+COMPOSE_VM_BATCH := $(COMPOSE) -f docker-compose.prod.yml -f docker-compose.vm-batch.yml
 
-.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch run-batch-preflight docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod deploy-vm vm-bootstrap
+.PHONY: venv healthcheck healthcheck-render bootstrap-render smoke smoke-dry render-smoke compile-config requeue-render run-batch run-batch-preflight docker-build docker-up docker-down docker-shell docker-run-batch docker-build-prod docker-up-prod docker-down-prod docker-build-vm-batch docker-up-vm-batch docker-down-vm-batch docker-logs-vm-batch deploy-vm deploy-vm-batch vm-bootstrap
 
 venv:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -141,8 +142,23 @@ docker-up-prod:
 docker-down-prod:
 	@$(COMPOSE_PROD) down
 
+docker-build-vm-batch:
+	@$(COMPOSE_VM_BATCH) build batch-worker
+
+docker-up-vm-batch:
+	@$(COMPOSE_VM_BATCH) up -d batch-worker
+
+docker-down-vm-batch:
+	@$(COMPOSE_VM_BATCH) stop batch-worker
+
+docker-logs-vm-batch:
+	@$(COMPOSE_VM_BATCH) logs -f --tail=200 batch-worker
+
 deploy-vm:
 	@bash scripts/deploy_vm.sh
+
+deploy-vm-batch:
+	@bash scripts/deploy_vm_batch.sh
 
 vm-bootstrap:
 	@bash scripts/bootstrap_vm.sh

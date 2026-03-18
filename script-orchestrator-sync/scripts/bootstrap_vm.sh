@@ -56,15 +56,25 @@ if [[ ! -f "${APP_DIR}/.env.prod" ]]; then
   cp "${APP_DIR}/.env.prod.example" "${APP_DIR}/.env.prod"
   echo "[bootstrap] Created ${APP_DIR}/.env.prod from template."
 fi
+if [[ ! -f "${APP_DIR}/.env.vm" ]]; then
+  cp "${APP_DIR}/.env.vm.example" "${APP_DIR}/.env.vm"
+  echo "[bootstrap] Created ${APP_DIR}/.env.vm from template."
+fi
 
 cat <<EOF
 [bootstrap] Complete.
 Next steps:
 1) Edit ${APP_DIR}/.env.prod
-2) For key-file auth, place JSON at ${APP_DIR}/secrets/google-application-credentials.json
-3) Deploy:
+2) Edit ${APP_DIR}/.env.vm for VM batch-worker overrides (recommended: RENDER_EXEC_BACKEND=local)
+3) For key-file auth, place JSON at ${APP_DIR}/secrets/google-application-credentials.json
+4) Deploy API container:
    cd ${APP_DIR}
    make docker-build-prod
    make docker-up-prod
    curl -fsS http://127.0.0.1:\${APP_PORT:-8000}/healthz
+5) Deploy batch-worker container:
+   cd ${APP_DIR}
+   make docker-build-vm-batch
+   make docker-up-vm-batch
+   make docker-logs-vm-batch
 EOF

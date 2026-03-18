@@ -1,0 +1,36 @@
+services:
+  batch-worker:
+    build:
+      context: ..
+      dockerfile: script-orchestrator-sync/Dockerfile
+      args:
+        BLENDER_VERSION: ${BLENDER_VERSION:-4.2.2}
+    image: script-orchestrator-sync:prod
+    working_dir: /workspace/script-orchestrator-sync
+    restart: unless-stopped
+    env_file:
+      - path: .env.prod
+        required: false
+      - path: .env.vm
+        required: false
+    environment:
+      PYTHONPATH: /workspace/script-orchestrator-sync/src
+      SHEETS_JSON_BASE_URL: ${SHEETS_JSON_BASE_URL:-https://YOUR-SHEETS-JSON-GATEWAY.a.run.app}
+      SHEETS_JSON_API_KEY: ${SHEETS_JSON_API_KEY:-}
+      CONTROL_SHEET_ID: ${CONTROL_SHEET_ID:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      REQUIRE_RENDER_BINARIES: ${REQUIRE_RENDER_BINARIES:-1}
+      RENDER_EXEC_BACKEND: ${RENDER_EXEC_BACKEND:-local}
+      BATCH_LOOP_INTERVAL_SECONDS: ${BATCH_LOOP_INTERVAL_SECONDS:-20}
+      BATCH_LOOP_EXIT_ON_ERROR: ${BATCH_LOOP_EXIT_ON_ERROR:-0}
+      BATCH_LOOP_ONCE: ${BATCH_LOOP_ONCE:-0}
+    volumes:
+      - ./work:/workspace/script-orchestrator-sync/work
+      - ./secrets:/secrets:ro
+      - ./work/vse_stitcher_cache:/root/.vse_stitcher_cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    command: ["/workspace/script-orchestrator-sync/scripts/vm_batch_worker.sh"]
