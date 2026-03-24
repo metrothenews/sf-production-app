@@ -50,7 +50,7 @@ def _prepare_common(monkeypatch, *, stitch_preset: str):
     monkeypatch.setattr(
         compiler,
         "build_cuts_from_config",
-        lambda cfg, *, naming_convention, start_index=1: [
+        lambda cfg, *, naming_convention, start_index=1, fps=30: [
             {"id": "clip_1", "start": "00:00:00.000", "end": "00:00:05.000", "filename": "short_001.mp4"}
         ],
     )

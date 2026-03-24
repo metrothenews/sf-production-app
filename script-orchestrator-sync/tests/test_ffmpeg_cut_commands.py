@@ -46,17 +46,40 @@ def test_build_ffmpeg_audio_trim_command() -> None:
     assert cmd == [
         "ffmpeg",
         "-y",
-        "-ss",
-        "00:00:05.000",
-        "-to",
-        "00:00:12.000",
         "-i",
         "/tmp/full.wav",
+        "-af",
+        "atrim=start=5.000:end=12.000,asetpts=PTS-STARTPTS",
         "-vn",
         "-acodec",
         "pcm_s16le",
         "/tmp/cut.wav",
     ]
+
+
+def test_build_ffmpeg_master_audio_cut_command() -> None:
+    cmd = render_agent.build_ffmpeg_master_audio_cut_command(
+        ffmpeg_bin="ffmpeg",
+        video_input_path="/tmp/master.mp4",
+        audio_input_path="/tmp/master.wav",
+        start="00:00:05.000",
+        end="00:00:12.000",
+        output_path="/tmp/cut.mp4",
+        fps=30,
+        aspect="9:16",
+    )
+    assert cmd[0:6] == ["ffmpeg", "-y", "-i", "/tmp/master.mp4", "-i", "/tmp/master.wav"]
+    assert "-filter_complex" in cmd
+    filter_idx = cmd.index("-filter_complex")
+    assert "trim=start=5.000:end=12.000" in cmd[filter_idx + 1]
+    assert "atrim=start=5.000:end=12.000" in cmd[filter_idx + 1]
+    assert "scale=1080:1920" in cmd[filter_idx + 1]
+    assert "-map" in cmd
+    assert "[v]" in cmd
+    assert "[a]" in cmd
+    assert "-maxrate" in cmd
+    assert "-bufsize" in cmd
+    assert cmd[-1] == "/tmp/cut.mp4"
 
 
 def test_build_vse_text_command_includes_auto_baseline_override() -> None:

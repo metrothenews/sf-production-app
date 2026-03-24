@@ -80,3 +80,37 @@ def test_build_render_job_upsert_payload_sets_queued_and_clears_lease() -> None:
     assert row["attempts"] == "0"
     assert row["max_attempts"] == "3"
     assert row["bpm"] == "136"
+    assert row["edit_mode"] == "found_footage"
+    assert row["performance_mode"] == ""
+    assert row["performance_preset"] == ""
+
+
+def test_build_render_job_upsert_payload_sets_performance_fields() -> None:
+    preset = {
+        "stitch_preset": "4a4b4c",
+        "text_preset": "preset_x",
+        "seed": 42,
+        "fps": 30,
+        "aspect": "9:16",
+        "bg_mode": "none",
+    }
+    row = compiler.build_render_job_upsert_payload(
+        {},
+        render_job_id="cfg_perf",
+        naming_convention="camp",
+        clips_library_folder_id="clips_folder",
+        manifest_drive_file_id="manifest_id",
+        audio_id="audio_id",
+        lyrics_id="lyrics_id",
+        copy_id="",
+        preset=preset,
+        bpm="128",
+        edit_mode="performance",
+        performance_mode="preset",
+        performance_preset="4a2br2cw",
+        output_parent_folder_id="out_parent",
+        now_iso="2026-03-03T01:00:00+00:00",
+    )
+    assert row["edit_mode"] == "performance"
+    assert row["performance_mode"] == "preset"
+    assert row["performance_preset"] == "4a2br2cw"

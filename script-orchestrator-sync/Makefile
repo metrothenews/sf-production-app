@@ -83,7 +83,7 @@ compile-config:
 	@if [ -z "$$CONTROL_SHEET_ID" ]; then echo "ERROR: CONTROL_SHEET_ID is required."; exit 1; fi
 	@set -euo pipefail; \
 	export CONFIG_SHEET_ID="$${CONFIG_SHEET_ID:-YOUR_GOOGLE_SHEET_ID}"; \
-	export CONFIG_TAB="$${CONFIG_TAB:-Sheet1}"; \
+	export CONFIG_TAB="$${CONFIG_TAB:-mode}"; \
 	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:ZZ2}"; \
 	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export OUTPUT_PARENT_FOLDER_ID="$${OUTPUT_PARENT_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
@@ -101,7 +101,7 @@ run-batch:
 	@if [ -z "$$CONTROL_SHEET_ID" ]; then echo "ERROR: CONTROL_SHEET_ID is required."; exit 1; fi
 	@set -euo pipefail; \
 	export CONFIG_SHEET_ID="$${CONFIG_SHEET_ID:-YOUR_GOOGLE_SHEET_ID}"; \
-	export CONFIG_TAB="$${CONFIG_TAB:-Sheet1}"; \
+	export CONFIG_TAB="$${CONFIG_TAB:-mode}"; \
 	export CONFIG_RANGE="$${CONFIG_RANGE:-A1:ZZ2}"; \
 	export CLIPS_LIBRARY_FOLDER_ID="$${CLIPS_LIBRARY_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \
 	export OUTPUT_PARENT_FOLDER_ID="$${OUTPUT_PARENT_FOLDER_ID:-YOUR_GOOGLE_SHEET_ID}"; \

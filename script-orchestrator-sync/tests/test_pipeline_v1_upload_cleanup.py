@@ -130,6 +130,53 @@ def test_upload_confirm_record_and_delete_rolls_back_drive_on_append_failure(mon
     assert local.exists()
 
 
+def test_upload_confirm_record_and_delete_refreshes_events_jsonl_verify_bytes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    local = tmp_path / "events.jsonl"
+    local.write_text("line-1\n", encoding="utf-8")
+    row = render_agent._build_output_row_from_file(
+        run_id="r1",
+        render_job_id="j1",
+        campaign_id="c1",
+        artifact_type="pipeline_events_jsonl",
+        file_path=str(local),
+        created_utc="2026-03-17T00:00:00+00:00",
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_append(_gw, _sheet_id, rows):
+        captured["rows"] = rows
+        return 1
+
+    class _Client:
+        def upload_file(self, *_args, **_kwargs) -> str:
+            # Simulate mutable events log growing between row materialization and verify.
+            with local.open("a", encoding="utf-8") as fh:
+                fh.write("line-2\n")
+            return "drive_events"
+
+        def confirm_upload_size(self, file_id: str, expected_bytes: int) -> None:
+            assert file_id == "drive_events"
+            assert expected_bytes == local.stat().st_size
+            captured["expected_bytes"] = expected_bytes
+
+    monkeypatch.setattr(render_agent, "append_outputs_index_rows", _fake_append)
+    out = render_agent._upload_confirm_record_and_delete(
+        gw=object(),
+        control_sheet_id="sheet_1",
+        client=_Client(),
+        artifact_row=row,
+        drive_folder_id="folder_1",
+        verify_mode="size",
+    )
+    assert out["drive_file_id"] == "drive_events"
+    assert out["bytes"] == local.stat().st_size
+    assert captured["rows"][0]["bytes"] == local.stat().st_size
+    # Events log should stay in place while logger remains active.
+    assert local.exists()
+
+
 def test_cleanup_pipeline_local_artifacts_failure_keeps_logs_only(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "so_work" / "run_1"
     logs = root / "logs"

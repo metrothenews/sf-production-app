@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
+from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -22,10 +23,11 @@ from so_sync.gcs_storage import GcsStorageError, GcsStorageClient  # noqa: E402
 from so_sync.render_repo import find_render_job_by_id, upsert_render_job  # noqa: E402
 
 CONFIG_SHEET_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
-CONFIG_TAB_DEFAULT = "Sheet1"
+CONFIG_TAB_DEFAULT = "mode"
 CONFIG_RANGE_DEFAULT = "A1:ZZ2"
 CLIPS_LIBRARY_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 OUTPUT_PARENT_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
+PERFORMANCE_SOURCE_FOLDER_ID_DEFAULT = "YOUR_GOOGLE_SHEET_ID"
 DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 COLLECTION_FOLDER_NAME_RE = re.compile(r"^collection-(\d+)$", flags=re.IGNORECASE)
@@ -49,12 +51,34 @@ EXEC_PRESET_MAP: Mapping[str, Dict[str, Any]] = {
     "exec_preset_1": {
         "stitch_preset": "4a4b4c",
         "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+        "performance_preset": "4a4b4c",
         "fps": 30,
         "aspect": "9:16",
         "bg_mode": "none",
         "seed": 42,
     }
 }
+
+EDIT_MODE_FOUND_FOOTAGE = "found_footage"
+EDIT_MODE_PERFORMANCE = "performance"
+PERFORMANCE_MODE_SIMPLE = "simple_sync_cut"
+PERFORMANCE_MODE_PRESET = "preset"
+PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+)([a-fA-F])([a-zA-Z]*)")
+PERFORMANCE_PRESET_ALLOWED_MODIFIERS = {"r", "b", "w"}
+PERFORMANCE_PRESET_FIELD_NAMES = [
+    "Performance Preset",
+    "Performance Presets",
+    "performance_preset_dsl",
+    "performance_preset",
+    "performance_presets",
+]
+EDIT_MODE_FF_ONLY = "FF_ONLY"
+EDIT_MODE_FF_PLUS_PERF = "FF_PLUS_PERF"
+FOUND_FOOTAGE_MODE_TAB_DEFAULT = "found-footage-mode"
+PERFORMANCE_MODE_TAB_DEFAULT = "performance-footage-mode"
+HYBRID_MODE_TAB_DEFAULT = "hybrid-mode"
+MODE_CONTROL_TAB_DEFAULT = "mode"
+LEGACY_MODE_CONTROL_TAB = "api-read"
 
 
 def ensure_drive_upload_credentials() -> str:
@@ -86,6 +110,9 @@ def build_render_job_upsert_payload(
     copy_id: str,
     preset: Mapping[str, Any],
     bpm: str = "",
+    edit_mode: str = EDIT_MODE_FOUND_FOOTAGE,
+    performance_mode: str = "",
+    performance_preset: str = "",
     output_parent_folder_id: str,
     now_iso: str,
 ) -> Dict[str, Any]:
@@ -111,6 +138,9 @@ def build_render_job_upsert_payload(
             "fps": int(preset["fps"]),
             "aspect": str(preset["aspect"]),
             "bg_mode": preset["bg_mode"],
+            "edit_mode": str(edit_mode or EDIT_MODE_FOUND_FOOTAGE),
+            "performance_mode": str(performance_mode or ""),
+            "performance_preset": str(performance_preset or ""),
             "output_mode": "drive",
             "output_drive_folder_id": output_parent_folder_id,
             "output_filename": str(existing.get("output_filename") or ""),
@@ -154,6 +184,261 @@ def normalize_bool(value: Any) -> bool:
     return text in {"true", "1", "yes", "y"}
 
 
+def normalize_edit_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return EDIT_MODE_FOUND_FOOTAGE
+    if raw in {EDIT_MODE_FOUND_FOOTAGE, EDIT_MODE_PERFORMANCE}:
+        return raw
+    raise RuntimeError(
+        f"Invalid Render Mode value {raw!r}; expected one of: {EDIT_MODE_FOUND_FOOTAGE}, {EDIT_MODE_PERFORMANCE}."
+    )
+
+
+def normalize_performance_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {PERFORMANCE_MODE_SIMPLE, PERFORMANCE_MODE_PRESET}:
+        return raw
+    raise RuntimeError(
+        f"Invalid Performance Mode value {raw!r}; expected one of: {PERFORMANCE_MODE_SIMPLE}, {PERFORMANCE_MODE_PRESET}."
+    )
+
+
+def parse_performance_preset_tokens(value: str) -> list[dict[str, Any]]:
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError("Performance preset is empty.")
+    out: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(raw):
+        m = PERFORMANCE_PRESET_TOKEN_RE.match(raw, idx)
+        if not m:
+            raise RuntimeError(f"Invalid performance preset token at offset {idx}: {raw!r}")
+        duration_text, clip_label, modifiers_raw = m.groups()
+        duration = int(duration_text)
+        if duration <= 0:
+            raise RuntimeError(f"Performance preset duration must be > 0: {raw!r}")
+        modifiers = str(modifiers_raw or "").lower()
+        for ch in modifiers:
+            if ch not in PERFORMANCE_PRESET_ALLOWED_MODIFIERS:
+                raise RuntimeError(
+                    f"Unsupported performance preset modifier {ch!r} in {raw!r}; "
+                    "allowed modifiers are: r, b, w."
+                )
+        out.append({"duration": duration, "clip": clip_label.lower(), "modifiers": modifiers})
+        idx = m.end()
+    if not out:
+        raise RuntimeError(f"Performance preset has no valid tokens: {raw!r}")
+    return out
+
+
+def normalize_performance_preset(value: Any) -> str:
+    raw = str(value or "").strip()
+    _ = parse_performance_preset_tokens(raw)
+    return raw
+
+
+def _extract_drive_file_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if DRIVE_ID_RE.match(raw):
+        return raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    path = str(parsed.path or "")
+    m = re.search(r"/d/([A-Za-z0-9_-]{20,})", path)
+    if m:
+        return str(m.group(1) or "")
+    q = parse_qs(str(parsed.query or ""))
+    q_id = str((q.get("id") or [""])[0] or "").strip()
+    if DRIVE_ID_RE.match(q_id):
+        return q_id
+    return ""
+
+
+def _performance_clip_name_resolution_enabled() -> bool:
+    raw = str(os.environ.get("PERFORMANCE_CLIP_NAME_RESOLUTION", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_render_mode_from_cfg(cfg: Mapping[str, Any]) -> str:
+    render_mode_raw = str(
+        _cfg_value_by_names(
+            cfg,
+            ["Render Mode", "render_mode"],
+            default="",
+        )
+        or ""
+    ).strip()
+    if render_mode_raw:
+        return normalize_edit_mode(render_mode_raw)
+    edit_mode = str(_cfg_value_by_names(cfg, ["Edit Mode", "edit_mode"], default="") or "").strip().upper()
+    if edit_mode == EDIT_MODE_FF_ONLY:
+        return EDIT_MODE_FOUND_FOOTAGE
+    if edit_mode == EDIT_MODE_FF_PLUS_PERF:
+        return EDIT_MODE_PERFORMANCE
+    mode_value = str(_cfg_value_by_names(cfg, ["Mode", "mode"], default="") or "").strip()
+    normalized_mode = _normalize_mode_label(mode_value)
+    if "performance" in normalized_mode or "hybrid" in normalized_mode:
+        return EDIT_MODE_PERFORMANCE
+    if "found" in normalized_mode and "footage" in normalized_mode:
+        return EDIT_MODE_FOUND_FOOTAGE
+    return EDIT_MODE_FOUND_FOOTAGE
+
+
+def _resolve_performance_mode_from_cfg(cfg: Mapping[str, Any], *, render_mode: str) -> str:
+    if render_mode != EDIT_MODE_PERFORMANCE:
+        return ""
+    override = str(os.environ.get("PERFORMANCE_MODE_OVERRIDE", "") or "").strip()
+    if override:
+        return normalize_performance_mode(override)
+    raw = str(
+        _cfg_value_by_names(
+            cfg,
+            ["Performance Mode", "performance_mode"],
+            default="",
+        )
+        or ""
+    ).strip()
+    if not raw:
+        return PERFORMANCE_MODE_SIMPLE
+    return normalize_performance_mode(raw)
+
+
+def _has_explicit_performance_mode(cfg: Mapping[str, Any]) -> bool:
+    raw = str(
+        _cfg_value_by_names(
+            cfg,
+            ["Performance Mode", "performance_mode"],
+            default="",
+        )
+        or ""
+    ).strip()
+    return bool(raw)
+
+
+def _has_explicit_performance_clip_ids(cfg: Mapping[str, Any]) -> bool:
+    for label in ("A", "B", "C", "D", "E", "F"):
+        key = f"Performance Clip {label} File ID"
+        alt = f"performance_clip_{label.lower()}_drive_file_id"
+        raw = str(_cfg_value_by_names(cfg, [key, alt], default="") or "").strip()
+        if raw:
+            return True
+    return False
+
+
+def _resolve_performance_audio_policy_from_cfg(cfg: Mapping[str, Any], *, render_mode: str) -> str:
+    if render_mode != EDIT_MODE_PERFORMANCE:
+        return ""
+    raw = str(
+        _cfg_value_by_names(
+            cfg,
+            ["Performance Audio Policy", "performance_audio_policy"],
+            default="",
+        )
+        or ""
+    ).strip().lower()
+    if not raw:
+        return "master_only"
+    if raw != "master_only":
+        raise RuntimeError(
+            f"Invalid performance audio policy {raw!r}; expected master_only."
+        )
+    return raw
+
+
+def _resolve_performance_source_folder_id(cfg: Mapping[str, Any]) -> str:
+    env_val = str(os.environ.get("PERFORMANCE_SOURCE_FOLDER_ID", "") or "").strip()
+    cfg_val = str(
+        _cfg_value_by_names(
+            cfg,
+            [
+                "Performance Source Folder ID",
+                "performance_source_folder_id",
+                "Performance Clips Folder ID",
+                "performance_clips_folder_id",
+            ],
+            default="",
+        )
+        or ""
+    ).strip()
+    chosen = cfg_val or env_val or PERFORMANCE_SOURCE_FOLDER_ID_DEFAULT
+    folder_id = _extract_drive_file_id(chosen)
+    if not folder_id:
+        m = re.search(r"/folders/([A-Za-z0-9_-]{20,})", str(chosen))
+        if m:
+            folder_id = str(m.group(1) or "")
+    if folder_id:
+        return folder_id
+    if DRIVE_ID_RE.match(chosen):
+        return chosen
+    raise RuntimeError(
+        f"Invalid performance source folder value {chosen!r}; expected Drive folder id or URL."
+    )
+
+
+def _list_folder_files_cached(
+    *,
+    drive_client: Any,
+    folder_id: str,
+    listing_cache: dict[str, list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    fid = str(folder_id or "").strip()
+    if not fid:
+        raise RuntimeError("Performance source folder id is required for name-based clip resolution.")
+    if fid in listing_cache:
+        return list(listing_cache[fid])
+    rows = list(drive_client.list_files_in_folder(fid))
+    listing_cache[fid] = rows
+    return rows
+
+
+def _resolve_performance_drive_file_ref(
+    *,
+    value: Any,
+    label: str,
+    drive_client: Any | None,
+    source_folder_id: str,
+    listing_cache: dict[str, list[dict[str, str]]] | None,
+) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    direct_id = _extract_drive_file_id(raw)
+    if direct_id:
+        return direct_id
+    if not _performance_clip_name_resolution_enabled():
+        raise RuntimeError(
+            f"{label} must be a Drive file id (or Drive URL) when PERFORMANCE_CLIP_NAME_RESOLUTION=0."
+        )
+    if drive_client is None or listing_cache is None:
+        raise RuntimeError(f"{label} must be a Drive file id (name search unavailable in this path).")
+    rows = _list_folder_files_cached(
+        drive_client=drive_client,
+        folder_id=source_folder_id,
+        listing_cache=listing_cache,
+    )
+    exact = [r for r in rows if str(r.get("name") or "") == raw]
+    if not exact:
+        target = raw.lower()
+        exact = [r for r in rows if str(r.get("name") or "").lower() == target]
+    if not exact:
+        raise RuntimeError(
+            f"{label} name not found in performance source folder {source_folder_id}: {raw!r}"
+        )
+    ids = sorted({str(r.get("id") or "").strip() for r in exact if str(r.get("id") or "").strip()})
+    if len(ids) != 1:
+        raise RuntimeError(
+            f"{label} name is ambiguous in performance source folder {source_folder_id}: {raw!r} ids={ids}"
+        )
+    return ids[0]
+
+
 def _cfg_value_by_names(cfg: Mapping[str, Any], names: Iterable[str], default: Any = "") -> Any:
     for name in names:
         if name in cfg:
@@ -166,7 +451,51 @@ def _cfg_value_by_names(cfg: Mapping[str, Any], names: Iterable[str], default: A
     return default
 
 
+def _normalize_mode_label(value: Any) -> str:
+    out = str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _mode_to_tab_name(mode_value: Any) -> str:
+    normalized = _normalize_mode_label(mode_value)
+    if not normalized:
+        return ""
+    if "hybrid" in normalized:
+        return str(os.environ.get("HYBRID_MODE_TAB", HYBRID_MODE_TAB_DEFAULT)).strip() or HYBRID_MODE_TAB_DEFAULT
+    if "performance" in normalized:
+        return (
+            str(os.environ.get("PERFORMANCE_MODE_TAB", PERFORMANCE_MODE_TAB_DEFAULT)).strip()
+            or PERFORMANCE_MODE_TAB_DEFAULT
+        )
+    if "found" in normalized and "footage" in normalized:
+        return (
+            str(os.environ.get("FOUND_FOOTAGE_MODE_TAB", FOUND_FOOTAGE_MODE_TAB_DEFAULT)).strip()
+            or FOUND_FOOTAGE_MODE_TAB_DEFAULT
+        )
+    return ""
+
+
+def _is_mode_control_tab(tab_name: Any) -> bool:
+    normalized = str(tab_name or "").strip().lower()
+    if not normalized:
+        return False
+    configured = str(os.environ.get("MODE_CONTROL_TAB", MODE_CONTROL_TAB_DEFAULT) or "").strip().lower()
+    if not configured:
+        configured = MODE_CONTROL_TAB_DEFAULT
+    return normalized in {configured, LEGACY_MODE_CONTROL_TAB}
+
+
 def resolve_song_title_overlay(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    override_raw = str(os.environ.get("DISPLAY_SONG_NAME_OVERRIDE", "") or "").strip()
+    if override_raw:
+        override_enabled = normalize_bool(override_raw)
+        if not override_enabled:
+            return {"enabled": False, "text": ""}
+        override_text = str(os.environ.get("SONG_NAME_OVERRIDE", "") or "").strip()
+        song_name = override_text or str(_cfg_value_by_names(cfg, ["Song Name"], default="") or "").strip()
+        if not song_name:
+            raise RuntimeError("Display Song Name? override is enabled but Song Name is empty.")
+        return {"enabled": True, "text": song_name}
     enabled = normalize_bool(
         _cfg_value_by_names(
             cfg,
@@ -214,19 +543,29 @@ def drive_reference_kind(value: str) -> str:
     return "id" if DRIVE_ID_RE.match(raw) else "name"
 
 
-def parse_hhmmssff_to_ms(value: str) -> int:
+def parse_hhmmssff_to_ms(value: str, *, fps: int = 30) -> int:
     m = re.match(r"^\s*(\d{2}):(\d{2}):(\d{2}):(\d{2})\s*$", str(value or ""))
     if not m:
         raise ValueError(f"Invalid HH:MM:SS:FF value: {value!r}")
     hh, mm, ss, ff = [int(x) for x in m.groups()]
-    if ff > 99:
-        raise ValueError(f"Invalid FF value (must be 00-99): {value!r}")
-    total_ms = ((hh * 3600 + mm * 60 + ss) * 1000) + (ff * 10)
+    ff_mode = str(os.environ.get("TIMECODE_FF_MODE", "centiseconds") or "centiseconds").strip().lower()
+    if ff_mode == "frames":
+        fps_int = int(fps or 0)
+        if fps_int <= 0:
+            raise ValueError(f"Invalid fps for HH:MM:SS:FF parsing: {fps!r}")
+        if ff >= fps_int:
+            raise ValueError(f"Invalid FF value for fps={fps_int} (must be 00-{fps_int-1:02d}): {value!r}")
+        ff_ms = int(round((ff / float(fps_int)) * 1000.0))
+    else:
+        if ff > 99:
+            raise ValueError(f"Invalid FF value (must be 00-99): {value!r}")
+        ff_ms = ff * 10
+    total_ms = ((hh * 3600 + mm * 60 + ss) * 1000) + ff_ms
     return total_ms
 
 
-def parse_hhmmssff_to_ffmpeg_ts(value: str) -> str:
-    total_ms = parse_hhmmssff_to_ms(value)
+def parse_hhmmssff_to_ffmpeg_ts(value: str, *, fps: int = 30) -> str:
+    total_ms = parse_hhmmssff_to_ms(value, fps=fps)
     hh = total_ms // 3_600_000
     rem = total_ms % 3_600_000
     mm = rem // 60_000
@@ -283,6 +622,7 @@ def build_cuts_from_config(
     *,
     naming_convention: str,
     start_index: int = 1,
+    fps: int = 30,
 ) -> list[dict[str, str]]:
     cuts: list[dict[str, str]] = []
     if not normalize_bool(_cfg_get(cfg, "Cut Clips?", False)):
@@ -300,15 +640,15 @@ def build_cuts_from_config(
         ).strip()
         if not start or not end:
             continue
-        start_ms = parse_hhmmssff_to_ms(start)
-        end_ms = parse_hhmmssff_to_ms(end)
+        start_ms = parse_hhmmssff_to_ms(start, fps=fps)
+        end_ms = parse_hhmmssff_to_ms(end, fps=fps)
         if end_ms <= start_ms:
             raise ValueError(f"Clip {slot} has end <= start: {start} -> {end}")
         cuts.append(
             {
                 "id": f"clip_{slot}",
-                "start": parse_hhmmssff_to_ffmpeg_ts(start),
-                "end": parse_hhmmssff_to_ffmpeg_ts(end),
+                "start": parse_hhmmssff_to_ffmpeg_ts(start, fps=fps),
+                "end": parse_hhmmssff_to_ffmpeg_ts(end, fps=fps),
                 "filename": video_filename_from_naming(naming_convention, start_index + out_idx),
             }
         )
@@ -675,18 +1015,42 @@ def select_asset_drive_file_id(
 
 
 def _read_config_row(gateway: Any, config_sheet_id: str, config_tab: str, config_range: str) -> Dict[str, Any]:
-    rng = f"{_quote_tab(config_tab)}!{config_range}"
-    data = gateway.read(config_sheet_id, [rng])
-    values = _extract_first_values_matrix(data)
-    if len(values) < 2:
-        raise RuntimeError(f"Expected header row + data row from {config_sheet_id} {rng}")
-    header = values[0]
-    row = values[1]
-    idx = _header_map(header)
-    out: Dict[str, Any] = {}
-    for h, i in idx.items():
-        out[str(header[i]).strip()] = _cell(row, i)
-    return out
+    def _read_tab_as_row(tab_name: str) -> Dict[str, Any]:
+        rng_local = f"{_quote_tab(tab_name)}!{config_range}"
+        data_local = gateway.read(config_sheet_id, [rng_local])
+        values_local = _extract_first_values_matrix(data_local)
+        if len(values_local) < 2:
+            raise RuntimeError(f"Expected header row + data row from {config_sheet_id} {rng_local}")
+        header_local = values_local[0]
+        row_local = values_local[1]
+        idx_local = _header_map(header_local)
+        out_local: Dict[str, Any] = {}
+        for h, i in idx_local.items():
+            out_local[str(header_local[i]).strip()] = _cell(row_local, i)
+        return out_local
+
+    control = _read_tab_as_row(config_tab)
+    if not _is_mode_control_tab(config_tab):
+        return control
+
+    mode_value = str(control.get("Mode") or "").strip()
+    if not mode_value:
+        raise RuntimeError(f"{config_tab} config row is missing required Mode value.")
+    selected_tab = _mode_to_tab_name(mode_value)
+    if not selected_tab:
+        raise RuntimeError(
+            f"Unsupported Mode value {mode_value!r}; expected found footage, performance, or hybrid."
+        )
+    routed = _read_tab_as_row(selected_tab)
+    merged: Dict[str, Any] = dict(control)
+    for key, val in routed.items():
+        if str(val or "").strip():
+            merged[key] = val
+        elif key not in merged:
+            merged[key] = val
+    merged["Mode"] = mode_value
+    merged["_mode_source_tab"] = selected_tab
+    return merged
 
 
 def _manifest_fingerprint(manifest: Dict[str, Any]) -> str:
@@ -787,6 +1151,111 @@ def _normalize_text_preset_name(raw: str) -> str:
     return text
 
 
+def _parse_performance_clip_map(
+    cfg: Mapping[str, Any],
+    *,
+    drive_client: Any | None = None,
+    source_folder_id: str = "",
+    listing_cache: dict[str, list[dict[str, str]]] | None = None,
+    auto_fill: bool | None = None,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for label in ("A", "B", "C", "D", "E", "F"):
+        key = f"Performance Clip {label} File ID"
+        alt = f"performance_clip_{label.lower()}_drive_file_id"
+        raw = str(_cfg_value_by_names(cfg, [key, alt], default="") or "").strip()
+        if not raw:
+            continue
+        out[label.lower()] = _resolve_performance_drive_file_ref(
+            value=raw,
+            label=key,
+            drive_client=drive_client,
+            source_folder_id=source_folder_id,
+            listing_cache=listing_cache,
+        )
+    if out:
+        return out
+    if auto_fill is None:
+        auto_raw = str(os.environ.get("PERFORMANCE_PRESET_AUTO_CLIPS", "0") or "0").strip().lower()
+        auto_fill = auto_raw not in {"0", "false", "no", "off"}
+    if not auto_fill:
+        return out
+    if drive_client is None or listing_cache is None or not str(source_folder_id or "").strip():
+        return out
+    rows = _list_folder_files_cached(
+        drive_client=drive_client,
+        folder_id=source_folder_id,
+        listing_cache=listing_cache,
+    )
+    video_rows = [
+        row
+        for row in rows
+        if str(row.get("id") or "").strip()
+        and _is_video_like(str(row.get("name") or ""), str(row.get("mimeType") or ""))
+    ]
+    video_rows.sort(key=lambda row: (str(row.get("name") or "").lower(), str(row.get("id") or "")))
+    for idx, row in enumerate(video_rows[:6]):
+        out[chr(ord("a") + idx)] = str(row.get("id") or "").strip()
+    if len(out) >= 2:
+        print(
+            "performance_clip_map_auto_resolved "
+            f"source_folder_id={source_folder_id} "
+            f"labels={','.join(sorted(out.keys()))}"
+        )
+    else:
+        out = {}
+    return out
+
+
+def _resolve_performance_master_clip_id(
+    cfg: Mapping[str, Any],
+    *,
+    drive_client: Any | None = None,
+    source_folder_id: str = "",
+    listing_cache: dict[str, list[dict[str, str]]] | None = None,
+) -> str:
+    key = "Performance Master Clip File ID"
+    raw = str(_cfg_value_by_names(cfg, [key, "performance_master_clip_drive_file_id"], default="") or "").strip()
+    if not raw:
+        raw = str(os.environ.get("PERFORMANCE_MASTER_CLIP_FILE_ID", "") or "").strip()
+    if not raw:
+        # Operator-friendly fallback: pick first deterministic video file from source folder
+        # when explicit master clip is omitted.
+        if drive_client is not None and listing_cache is not None and str(source_folder_id or "").strip():
+            rows = _list_folder_files_cached(
+                drive_client=drive_client,
+                folder_id=source_folder_id,
+                listing_cache=listing_cache,
+            )
+            video_rows = [
+                r
+                for r in rows
+                if str(r.get("id") or "").strip()
+                and _is_video_like(str(r.get("name") or ""), str(r.get("mimeType") or ""))
+            ]
+            video_rows.sort(key=lambda r: (str(r.get("name") or "").lower(), str(r.get("id") or "")))
+            if video_rows:
+                chosen = str(video_rows[0].get("id") or "").strip()
+                if chosen:
+                    print(
+                        "performance_master_clip_auto_resolved "
+                        f"source_folder_id={source_folder_id} "
+                        f"file_id={chosen} name={str(video_rows[0].get('name') or '')!r}"
+                    )
+                    return chosen
+        raise RuntimeError(
+            f"Missing required config field for simple performance mode: {key} "
+            f"(and no video files found in performance source folder {source_folder_id})."
+        )
+    return _resolve_performance_drive_file_ref(
+        value=raw,
+        label=key,
+        drive_client=drive_client,
+        source_folder_id=source_folder_id,
+        listing_cache=listing_cache,
+    )
+
+
 def _read_preset_rows(gateway: SheetsGateway, preset_sheet_id: str, tab: str = "Sheet1") -> list[dict[str, str]]:
     rng = f"{_quote_tab(tab)}!A1:Z200"
     data = gateway.read(preset_sheet_id, [rng])
@@ -795,18 +1264,105 @@ def _read_preset_rows(gateway: SheetsGateway, preset_sheet_id: str, tab: str = "
         return []
     rows: list[dict[str, str]] = []
     last_lyric = ""
+    last_performance = ""
     for raw in values[1:]:
+        if not any(str(cell or "").strip() for cell in raw):
+            continue
         ff = str(raw[0]).strip() if len(raw) > 0 else ""
+        performance = str(raw[1]).strip() if len(raw) > 1 else ""
         lyric = str(raw[2]).strip() if len(raw) > 2 else ""
         lyric_norm = _normalize_text_preset_name(lyric)
         if lyric_norm:
             last_lyric = lyric_norm
         elif last_lyric:
             lyric_norm = last_lyric
-        if not ff and not lyric:
+        if performance:
+            last_performance = performance
+        elif last_performance:
+            performance = last_performance
+        if not ff and not lyric and not performance:
             continue
-        rows.append({"stitch_preset": ff, "text_preset": lyric_norm})
+        rows.append(
+            {
+                "stitch_preset": ff,
+                "text_preset": lyric_norm,
+                "performance_preset": performance,
+            }
+        )
     return rows
+
+
+def _performance_preset_autofill_enabled() -> bool:
+    raw = str(os.environ.get("PERFORMANCE_PRESET_AUTOFILL", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _a1_col_from_index(idx: int) -> str:
+    if idx < 0:
+        raise ValueError(f"Column index must be >= 0, got {idx}")
+    out = ""
+    value = int(idx) + 1
+    while value > 0:
+        value, rem = divmod(value - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+
+def _autofill_performance_presets_column(
+    gateway: SheetsGateway,
+    preset_sheet_id: str,
+    *,
+    tab: str,
+    fill_value: str,
+) -> int:
+    value = str(fill_value or "").strip()
+    if not value:
+        return 0
+    value = normalize_performance_preset(value)
+    rng = f"{_quote_tab(tab)}!A1:Z200"
+    data = gateway.read(preset_sheet_id, [rng])
+    rows = _extract_first_values_matrix(data)
+    if len(rows) < 2:
+        return 0
+
+    header = rows[0]
+    idx = _header_map(header)
+    perf_idx = idx.get("performance presets")
+    if perf_idx is None:
+        perf_idx = idx.get("performance preset")
+    if perf_idx is None:
+        perf_idx = idx.get("performance_preset")
+    if perf_idx is None:
+        return 0
+
+    ff_idx = idx.get("ff presets")
+    if ff_idx is None:
+        ff_idx = idx.get("found footage presets")
+    if ff_idx is None:
+        ff_idx = 0
+
+    data_rows = rows[1:]
+    has_any_performance = any(str(_cell(r, perf_idx)).strip() for r in data_rows)
+    if has_any_performance:
+        return 0
+
+    updates: list[dict[str, Any]] = []
+    perf_col = _a1_col_from_index(perf_idx)
+    for row_num, row in enumerate(data_rows, start=2):
+        ff_value = str(_cell(row, ff_idx)).strip()
+        perf_value = str(_cell(row, perf_idx)).strip()
+        if not ff_value or perf_value:
+            continue
+        updates.append(
+            {
+                "range": f"{_quote_tab(tab)}!{perf_col}{row_num}",
+                "values": [[value]],
+            }
+        )
+    if not updates:
+        return 0
+    gateway.write(preset_sheet_id, updates)
+    return len(updates)
 
 
 def main() -> int:
@@ -829,6 +1385,9 @@ def main() -> int:
     ensure_drive_upload_credentials()
 
     cfg = _read_config_row(gw, config_sheet_id, config_tab, config_range)
+    mode_value = str(cfg.get("Mode") or "").strip()
+    source_tab = str(cfg.get("_mode_source_tab") or config_tab).strip() or config_tab
+    print(f"config_mode={mode_value or '(unset)'} config_source_tab={source_tab}")
     print("preflight_asset_ids:")
     preflight_fields = [
         ("Audio File", "Audio File ID", False),
@@ -863,6 +1422,25 @@ def main() -> int:
         raise RuntimeError(
             f"Unknown Executive Preset '{exec_preset_name}'. Known presets={sorted(EXEC_PRESET_MAP.keys())}"
         )
+    render_mode = _resolve_render_mode_from_cfg(cfg)
+    performance_mode = _resolve_performance_mode_from_cfg(cfg, render_mode=render_mode)
+    performance_audio_policy = _resolve_performance_audio_policy_from_cfg(cfg, render_mode=render_mode)
+    performance_source_folder_id = _resolve_performance_source_folder_id(cfg)
+    performance_name_resolution = "enabled" if _performance_clip_name_resolution_enabled() else "disabled"
+    print(
+        f"performance_source_folder_id={performance_source_folder_id} "
+        f"performance_clip_name_resolution={performance_name_resolution}"
+    )
+    performance_preset_fallback = str(
+        _cfg_value_by_names(
+            cfg,
+            PERFORMANCE_PRESET_FIELD_NAMES,
+            default="",
+        )
+        or ""
+    ).strip()
+    if performance_preset_fallback:
+        performance_preset_fallback = normalize_performance_preset(performance_preset_fallback)
 
     audio_id = select_asset_drive_file_id(
         cfg,
@@ -892,8 +1470,226 @@ def main() -> int:
         clips_library_folder_id=clips_library_folder_id,
     )
     stitch_bpm = resolve_stitch_bpm(cfg)
+    timeline_fps = int(preset["fps"])
+    performance_aspect = str(os.environ.get("PERFORMANCE_ASPECT", "9:16") or "9:16").strip() or "9:16"
 
-    base_cuts = build_cuts_from_config(cfg, naming_convention=naming_convention, start_index=0)
+    base_cuts = build_cuts_from_config(
+        cfg,
+        naming_convention=naming_convention,
+        start_index=0,
+        fps=timeline_fps,
+    )
+    clip_count = len(base_cuts)
+    required_runs = _required_run_count(number_of_videos, clip_count)
+    preset_sheet_id = str(cfg.get("Executive Preset File ID") or "").strip()
+    dynamic_preset_rows: list[dict[str, str]] = []
+    if preset_sheet_id and drive_reference_kind(preset_sheet_id) == "id":
+        if render_mode == EDIT_MODE_PERFORMANCE and _performance_preset_autofill_enabled():
+            autofill_value = performance_preset_fallback or str(preset.get("performance_preset") or "").strip()
+            filled = _autofill_performance_presets_column(
+                gw,
+                preset_sheet_id,
+                tab=os.environ.get("EXEC_PRESET_TAB", "Sheet1"),
+                fill_value=autofill_value,
+            )
+            if filled > 0:
+                print(
+                    f"performance_presets_autofill sheet_id={preset_sheet_id} "
+                    f"tab={os.environ.get('EXEC_PRESET_TAB', 'Sheet1')} cells_filled={filled}"
+                )
+        dynamic_preset_rows = _read_preset_rows(gw, preset_sheet_id, tab=os.environ.get("EXEC_PRESET_TAB", "Sheet1"))
+    if not dynamic_preset_rows:
+        dynamic_preset_rows = [
+            {
+                "stitch_preset": str(preset["stitch_preset"]),
+                "text_preset": str(preset["text_preset"]),
+                "performance_preset": performance_preset_fallback,
+            }
+        ]
+    if (
+        render_mode == EDIT_MODE_PERFORMANCE
+        and performance_mode == PERFORMANCE_MODE_SIMPLE
+        and not _has_explicit_performance_mode(cfg)
+    ):
+        has_performance_preset = bool(performance_preset_fallback) or any(
+            str(row.get("performance_preset") or "").strip() for row in dynamic_preset_rows
+        )
+        if has_performance_preset:
+            performance_mode = PERFORMANCE_MODE_PRESET
+            print(
+                "performance_mode_auto_inferred "
+                "mode=preset reason=performance_preset_detected "
+                "source=executive_preset_sheet_or_config"
+            )
+
+    if render_mode == EDIT_MODE_PERFORMANCE:
+        base_job_id = _render_job_id(config_sheet_id, config_tab, row_index=2)
+        queued_job_ids: list[str] = []
+        manifest_ids: list[str] = []
+        rng = random.SystemRandom()
+        drive_client = drive_upload_from_env()
+        performance_listing_cache: dict[str, list[dict[str, str]]] = {}
+
+        performance_master_clip_id = ""
+        performance_clips: dict[str, str] = {}
+        if performance_mode == PERFORMANCE_MODE_SIMPLE:
+            performance_master_clip_id = _resolve_performance_master_clip_id(
+                cfg,
+                drive_client=drive_client,
+                source_folder_id=performance_source_folder_id,
+                listing_cache=performance_listing_cache,
+            )
+        else:
+            auto_clip_fill = not _has_explicit_performance_clip_ids(cfg)
+            performance_clips = _parse_performance_clip_map(
+                cfg,
+                drive_client=drive_client,
+                source_folder_id=performance_source_folder_id,
+                listing_cache=performance_listing_cache,
+                auto_fill=auto_clip_fill,
+            )
+            if not (2 <= len(performance_clips) <= 6):
+                if auto_clip_fill:
+                    raise RuntimeError(
+                        "Performance preset mode requires at least 2 video clips in "
+                        f"performance source folder {performance_source_folder_id}."
+                    )
+                raise RuntimeError(
+                    "Performance preset mode requires 2-6 clip ids via "
+                    "Performance Clip A/B/C/D/E/F File ID fields."
+                )
+
+        performance_target_videos = min(number_of_videos, clip_count)
+        if number_of_videos > clip_count:
+            print(
+                "performance_target_videos_clamped "
+                f"requested={number_of_videos} enabled_cuts={clip_count} effective={performance_target_videos}"
+            )
+        required_runs = 1
+
+        for i in range(required_runs):
+            run_cuts = build_cuts_from_config(
+                cfg,
+                naming_convention=naming_convention,
+                start_index=(i * clip_count) + 1,
+                fps=timeline_fps,
+            )
+            remaining = max(0, performance_target_videos - (i * clip_count))
+            if remaining > 0 and len(run_cuts) > remaining:
+                run_cuts = run_cuts[:remaining]
+
+            run_cuts_with_exec: list[dict[str, Any]] = []
+            selected_performance_preset = ""
+            for cut_idx, cut in enumerate(run_cuts):
+                output_idx = (i * clip_count) + cut_idx
+                cut_preset_row = dynamic_preset_rows[output_idx % len(dynamic_preset_rows)]
+                cut_text_preset = str(cut_preset_row.get("text_preset") or preset["text_preset"]).strip()
+                if not cut_text_preset:
+                    cut_text_preset = str(preset["text_preset"])
+                cut_seed = int(rng.randrange(1, 2_147_483_647))
+                cut_row = dict(cut)
+                cut_row.update(
+                        {
+                            "text_preset": cut_text_preset,
+                            "seed": cut_seed,
+                            "fps": int(preset["fps"]),
+                            "aspect": performance_aspect,
+                            "bg_mode": str(preset["bg_mode"]),
+                        }
+                    )
+                if performance_mode == PERFORMANCE_MODE_PRESET:
+                    cut_performance_preset = str(
+                        cut_preset_row.get("performance_preset") or performance_preset_fallback or ""
+                    ).strip()
+                    if not cut_performance_preset:
+                        raise RuntimeError(
+                            "Performance preset mode requires a preset DSL value from "
+                            "Executive Preset File column B or config field Performance Preset(s)."
+                        )
+                    cut_performance_preset = normalize_performance_preset(cut_performance_preset)
+                    cut_row["performance_preset"] = cut_performance_preset
+                    if not selected_performance_preset:
+                        selected_performance_preset = cut_performance_preset
+                run_cuts_with_exec.append(cut_row)
+
+            manifest: Dict[str, Any] = {
+                "schema_version": "pipeline_v1@2",
+                "edit_mode": EDIT_MODE_PERFORMANCE,
+                "campaign_id": naming_convention,
+                "inputs": {
+                    "audio_drive_file_id": audio_id,
+                    "lyrics_srt_drive_file_id": lyrics_id,
+                    "copy_srt_drive_file_id": copy_id or "",
+                },
+                "text": {
+                    "preset": str(preset["text_preset"]),
+                    "bg_mode": str(preset["bg_mode"]),
+                    "fps": int(preset["fps"]),
+                    "aspect": performance_aspect,
+                    "song_title": {
+                        "enabled": bool(song_title_overlay.get("enabled")),
+                        "text": str(song_title_overlay.get("text") or ""),
+                    },
+                },
+                "performance": {
+                    "mode": performance_mode,
+                    "audio_policy": performance_audio_policy or "master_only",
+                    "master_clip_drive_file_id": performance_master_clip_id,
+                    "clips": performance_clips,
+                    "preset": selected_performance_preset if performance_mode == PERFORMANCE_MODE_PRESET else "",
+                    "source_folder_id": performance_source_folder_id,
+                },
+                "cuts": run_cuts_with_exec,
+            }
+            manifest_drive_file_id = _upload_manifest(
+                manifest,
+                naming_convention=naming_convention,
+                output_parent_folder_id=output_parent_folder_id,
+            )
+            manifest_ids.append(manifest_drive_file_id)
+
+            render_job_id = _render_job_id_for_iteration(base_job_id, i + 1, required_runs)
+            existing = find_render_job_by_id(gw, control_sheet_id, render_job_id) or {}
+            now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            row = build_render_job_upsert_payload(
+                existing,
+                render_job_id=render_job_id,
+                naming_convention=naming_convention,
+                clips_library_folder_id=performance_source_folder_id,
+                manifest_drive_file_id=manifest_drive_file_id,
+                audio_id=audio_id,
+                lyrics_id=lyrics_id,
+                copy_id=copy_id,
+                preset=preset,
+                bpm=f"{stitch_bpm:g}",
+                edit_mode=EDIT_MODE_PERFORMANCE,
+                performance_mode=performance_mode,
+                performance_preset=selected_performance_preset,
+                output_parent_folder_id=output_parent_folder_id,
+                now_iso=now_iso,
+            )
+            upsert_render_job(gw, control_sheet_id, row)
+            queued_job_ids.append(render_job_id)
+            print(
+                f"queued_render_job_id={render_job_id} "
+                f"manifest_drive_file_id={manifest_drive_file_id} "
+                f"edit_mode={EDIT_MODE_PERFORMANCE} performance_mode={performance_mode} "
+                f"performance_preset={selected_performance_preset}"
+            )
+
+        print(f"required_runs={required_runs}")
+        print(f"clip_count={clip_count}")
+        print(f"number_of_videos={number_of_videos}")
+        print(f"cuts_generated={len(base_cuts)}")
+        print(f"audio_drive_file_id={audio_id}")
+        print(f"display_song_name={1 if song_title_overlay.get('enabled') else 0}")
+        print(f"song_name={song_title_overlay.get('text') or ''}")
+        print(f"lyrics_srt_drive_file_id={lyrics_id}")
+        print(f"copy_srt_drive_file_id={copy_id or ''}")
+        print(f"queued_jobs={json.dumps(queued_job_ids)}")
+        print(f"manifest_ids={json.dumps(manifest_ids)}")
+        return 0
+
     drive_client = drive_upload_from_env()
     clips_source_mode = _clips_source_mode()
     mirror_bucket = str(os.environ.get("CLIPS_LIBRARY_MIRROR_BUCKET", "")).strip()
@@ -993,9 +1789,28 @@ def main() -> int:
     preset_sheet_id = str(cfg.get("Executive Preset File ID") or "").strip()
     dynamic_preset_rows: list[dict[str, str]] = []
     if preset_sheet_id and drive_reference_kind(preset_sheet_id) == "id":
+        if render_mode == EDIT_MODE_PERFORMANCE and _performance_preset_autofill_enabled():
+            autofill_value = performance_preset_fallback or str(preset.get("performance_preset") or "").strip()
+            filled = _autofill_performance_presets_column(
+                gw,
+                preset_sheet_id,
+                tab=os.environ.get("EXEC_PRESET_TAB", "Sheet1"),
+                fill_value=autofill_value,
+            )
+            if filled > 0:
+                print(
+                    f"performance_presets_autofill sheet_id={preset_sheet_id} "
+                    f"tab={os.environ.get('EXEC_PRESET_TAB', 'Sheet1')} cells_filled={filled}"
+                )
         dynamic_preset_rows = _read_preset_rows(gw, preset_sheet_id, tab=os.environ.get("EXEC_PRESET_TAB", "Sheet1"))
     if not dynamic_preset_rows:
-        dynamic_preset_rows = [{"stitch_preset": str(preset["stitch_preset"]), "text_preset": str(preset["text_preset"])}]
+        dynamic_preset_rows = [
+            {
+                "stitch_preset": str(preset["stitch_preset"]),
+                "text_preset": str(preset["text_preset"]),
+                "performance_preset": performance_preset_fallback,
+            }
+        ]
 
     base_job_id = _render_job_id(config_sheet_id, config_tab, row_index=2)
     queued_job_ids: list[str] = []
@@ -1016,6 +1831,7 @@ def main() -> int:
             cfg,
             naming_convention=naming_convention,
             start_index=(i * clip_count) + 1,
+            fps=timeline_fps,
         )
         remaining = max(0, number_of_videos - (i * clip_count))
         if remaining > 0 and len(run_cuts) > remaining:
@@ -1129,7 +1945,8 @@ def main() -> int:
                 pass
 
         manifest: Dict[str, Any] = {
-            "schema_version": "pipeline_v1@1",
+            "schema_version": "pipeline_v1@2",
+            "edit_mode": EDIT_MODE_FOUND_FOOTAGE,
             "campaign_id": naming_convention,
             "inputs": {
                 "clips_drive_folder_id": run_collection_folder_id,
@@ -1161,6 +1978,14 @@ def main() -> int:
                     "text": str(song_title_overlay.get("text") or ""),
                 },
             },
+            "performance": {
+                "mode": "",
+                "audio_policy": "",
+                "master_clip_drive_file_id": "",
+                "clips": {},
+                "preset": "",
+                "source_folder_id": "",
+            },
             "cuts": run_cuts_with_exec,
         }
         manifest_drive_file_id = _upload_manifest(
@@ -1184,6 +2009,9 @@ def main() -> int:
             copy_id=copy_id,
             preset=effective_preset,
             bpm=f"{stitch_bpm:g}",
+            edit_mode=EDIT_MODE_FOUND_FOOTAGE,
+            performance_mode="",
+            performance_preset="",
             output_parent_folder_id=output_parent_folder_id,
             now_iso=now_iso,
         )

@@ -145,7 +145,7 @@ def _row_changed(a: List[Any], b: List[Any]) -> bool:
 def _default_job_template() -> Dict[str, Any]:
     source_sheet = os.environ.get("SAMPLE_SOURCE_SHEET_ID", "YOUR_GOOGLE_SHEET_ID").strip()
     target_sheet = os.environ.get("SAMPLE_TARGET_SHEET_ID", "YOUR_GOOGLE_SHEET_ID").strip()
-    source_tab = os.environ.get("SAMPLE_SOURCE_TAB", "Sheet2").strip()
+    source_tab = os.environ.get("SAMPLE_SOURCE_TAB", "mode").strip()
     target_tab = os.environ.get("SAMPLE_TARGET_TAB", "SO Campaigns").strip()
     return {
         "job_id": DEFAULT_JOB_ID,

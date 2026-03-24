@@ -57,8 +57,22 @@ VSE_STITCHER_SCRIPT_PATH = os.environ.get("VSE_STITCHER_SCRIPT_PATH", "").strip(
 VSE_EFFECTS_SCRIPT_PATH = os.environ.get("VSE_EFFECTS_SCRIPT_PATH", "").strip() or str(
     (WORKSPACE_ROOT / "vse-stitcher" / "scripts" / "vse_effects_pass_deterministic_bl456.py").resolve()
 )
+VSE_PERFORMANCE_SCRIPT_PATH = os.environ.get("VSE_PERFORMANCE_SCRIPT_PATH", "").strip() or str(
+    (WORKSPACE_ROOT / "vse-stitcher" / "scripts" / "vse_performance_preset_deterministic_bl456.py").resolve()
+)
 DEFAULT_FFMPEG_BIN = "ffmpeg"
 DEFAULT_STAGE_HEARTBEAT_SECONDS = 20.0
+INSTAGRAM_DEFAULT_VIDEO_BITRATE_CAP_BPS = 8_000_000
+INSTAGRAM_DEFAULT_VIDEO_TARGET_BITRATE_BPS = 6_000_000
+INSTAGRAM_DEFAULT_AUDIO_BITRATE = "128k"
+INSTAGRAM_DEFAULT_SOURCE_MAX_BYTES = 120 * 1024 * 1024
+INSTAGRAM_DEFAULT_SOURCE_MAX_BITRATE_BPS = 20_000_000
+EDIT_MODE_FOUND_FOOTAGE = "found_footage"
+EDIT_MODE_PERFORMANCE = "performance"
+PERFORMANCE_MODE_SIMPLE = "simple_sync_cut"
+PERFORMANCE_MODE_PRESET = "preset"
+PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+)([a-fA-F])([a-zA-Z]*)")
+PERFORMANCE_PRESET_ALLOWED_MODIFIERS = {"r", "b", "w"}
 
 _EVENT_LOGGER: RenderEventLogger | None = None
 _EVENT_RUN_ID = ""
@@ -409,6 +423,68 @@ def resolve_song_title_overlay(manifest: dict[str, Any], job: dict[str, Any]) ->
     return {"enabled": True, "text": text}
 
 
+def resolve_pipeline_edit_mode(manifest: dict[str, Any], job: dict[str, Any]) -> str:
+    job_mode = str(job.get("edit_mode") or "").strip().lower()
+    if job_mode:
+        if job_mode in {EDIT_MODE_FOUND_FOOTAGE, EDIT_MODE_PERFORMANCE}:
+            return job_mode
+        raise RuntimeError(
+            f"Unsupported edit_mode={job_mode!r}; expected {EDIT_MODE_FOUND_FOOTAGE} or {EDIT_MODE_PERFORMANCE}."
+        )
+    manifest_mode = str(manifest.get("edit_mode") or "").strip().lower() if isinstance(manifest, dict) else ""
+    if manifest_mode:
+        if manifest_mode in {EDIT_MODE_FOUND_FOOTAGE, EDIT_MODE_PERFORMANCE}:
+            return manifest_mode
+        raise RuntimeError(
+            f"Unsupported manifest edit_mode={manifest_mode!r}; expected {EDIT_MODE_FOUND_FOOTAGE} or {EDIT_MODE_PERFORMANCE}."
+        )
+    return EDIT_MODE_FOUND_FOOTAGE
+
+
+def resolve_pipeline_performance_mode(manifest: dict[str, Any], job: dict[str, Any]) -> str:
+    perf_cfg = manifest.get("performance", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(perf_cfg, dict):
+        perf_cfg = {}
+    raw = (
+        str(job.get("performance_mode") or "").strip().lower()
+        or str(perf_cfg.get("mode") or "").strip().lower()
+    )
+    if raw in {PERFORMANCE_MODE_SIMPLE, PERFORMANCE_MODE_PRESET}:
+        return raw
+    raise RuntimeError(
+        f"Invalid performance mode {raw!r}; expected {PERFORMANCE_MODE_SIMPLE} or {PERFORMANCE_MODE_PRESET}."
+    )
+
+
+def parse_performance_preset_tokens(value: str) -> list[dict[str, Any]]:
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError("Performance preset is empty.")
+    out: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(raw):
+        m = PERFORMANCE_PRESET_TOKEN_RE.match(raw, idx)
+        if not m:
+            raise RuntimeError(f"Invalid performance preset token at offset {idx}: {raw!r}")
+        duration_text, clip_label, modifiers_raw = m.groups()
+        duration = int(duration_text)
+        if duration <= 0:
+            raise RuntimeError(f"Performance preset duration must be > 0: {raw!r}")
+        clip = clip_label.lower()
+        modifiers = str(modifiers_raw or "").lower()
+        for ch in modifiers:
+            if ch not in PERFORMANCE_PRESET_ALLOWED_MODIFIERS:
+                raise RuntimeError(
+                    f"Unsupported performance preset modifier {ch!r} in {raw!r}; "
+                    "allowed modifiers are: r, b, w."
+                )
+        out.append({"duration": duration, "clip": clip, "modifiers": modifiers})
+        idx = m.end()
+    if not out:
+        raise RuntimeError(f"Performance preset has no valid tokens: {raw!r}")
+    return out
+
+
 def _safe_link_or_copy(src: str, dst: str) -> None:
     src_path = Path(src)
     dst_path = Path(dst)
@@ -519,6 +595,171 @@ def build_ffmpeg_cut_command(
     ]
 
 
+def _aspect_to_resolution(aspect: str) -> tuple[int, int]:
+    key = str(aspect or "").strip().lower()
+    if key in {"9:16", "9x16", "vertical"}:
+        return (1080, 1920)
+    if key in {"16:9", "16x9", "horizontal"}:
+        return (1920, 1080)
+    return (1080, 1920)
+
+
+def _instagram_video_bitrate_cap_bps() -> int:
+    return max(1_000_000, _to_int(os.environ.get("INSTAGRAM_VIDEO_BITRATE_CAP_BPS", str(INSTAGRAM_DEFAULT_VIDEO_BITRATE_CAP_BPS)), INSTAGRAM_DEFAULT_VIDEO_BITRATE_CAP_BPS))
+
+
+def _instagram_video_target_bitrate_bps() -> int:
+    cap = _instagram_video_bitrate_cap_bps()
+    target = _to_int(os.environ.get("INSTAGRAM_VIDEO_TARGET_BITRATE_BPS", str(INSTAGRAM_DEFAULT_VIDEO_TARGET_BITRATE_BPS)), INSTAGRAM_DEFAULT_VIDEO_TARGET_BITRATE_BPS)
+    return max(500_000, min(cap, int(target)))
+
+
+def _instagram_source_max_bytes() -> int:
+    return max(10 * 1024 * 1024, _to_int(os.environ.get("INSTAGRAM_SOURCE_MAX_BYTES", str(INSTAGRAM_DEFAULT_SOURCE_MAX_BYTES)), INSTAGRAM_DEFAULT_SOURCE_MAX_BYTES))
+
+
+def _instagram_source_max_bitrate_bps() -> int:
+    return max(5_000_000, _to_int(os.environ.get("INSTAGRAM_SOURCE_MAX_BITRATE_BPS", str(INSTAGRAM_DEFAULT_SOURCE_MAX_BITRATE_BPS)), INSTAGRAM_DEFAULT_SOURCE_MAX_BITRATE_BPS))
+
+
+def _ffmpeg_bitrate_string(bps: int) -> str:
+    kbps = max(64, int(round(float(max(1, int(bps))) / 1000.0)))
+    return f"{kbps}k"
+
+
+def build_ffmpeg_instagram_normalize_command(
+    *,
+    ffmpeg_bin: str,
+    input_path: str,
+    output_path: str,
+    fps: int,
+    aspect: str,
+    include_audio: bool,
+) -> list[str]:
+    width, height = _aspect_to_resolution(aspect)
+    target_bps = _instagram_video_target_bitrate_bps()
+    cap_bps = _instagram_video_bitrate_cap_bps()
+    buf_bps = max(cap_bps * 2, target_bps * 2)
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={int(max(1, int(fps)))},"
+        "format=yuv420p"
+    )
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        input_path,
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-profile:v",
+        "high",
+        "-level:v",
+        "4.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        _ffmpeg_bitrate_string(target_bps),
+        "-maxrate",
+        _ffmpeg_bitrate_string(cap_bps),
+        "-bufsize",
+        _ffmpeg_bitrate_string(buf_bps),
+        "-movflags",
+        "+faststart",
+    ]
+    if include_audio:
+        cmd.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                str(os.environ.get("INSTAGRAM_AUDIO_BITRATE", INSTAGRAM_DEFAULT_AUDIO_BITRATE) or INSTAGRAM_DEFAULT_AUDIO_BITRATE),
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-shortest",
+            ]
+        )
+    else:
+        cmd.extend(["-an"])
+    cmd.append(output_path)
+    return cmd
+
+
+def build_ffmpeg_master_audio_cut_command(
+    *,
+    ffmpeg_bin: str,
+    video_input_path: str,
+    audio_input_path: str,
+    start: str,
+    end: str,
+    output_path: str,
+    fps: int,
+    aspect: str,
+) -> list[str]:
+    start_s = _parse_ffmpeg_timestamp_to_seconds(start)
+    end_s = _parse_ffmpeg_timestamp_to_seconds(end)
+    width, height = _aspect_to_resolution(aspect)
+    target_bps = _instagram_video_target_bitrate_bps()
+    cap_bps = _instagram_video_bitrate_cap_bps()
+    buf_bps = max(cap_bps * 2, target_bps * 2)
+    return [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        video_input_path,
+        "-i",
+        audio_input_path,
+        "-filter_complex",
+        (
+            f"[0:v]trim=start={start_s:.3f}:end={end_s:.3f},setpts=PTS-STARTPTS,"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+            f"fps={int(max(1, int(fps)))},"
+            "format=yuv420p[v];"
+            f"[1:a]atrim=start={start_s:.3f}:end={end_s:.3f},asetpts=PTS-STARTPTS[a]"
+        ),
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-profile:v",
+        "high",
+        "-level:v",
+        "4.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        _ffmpeg_bitrate_string(target_bps),
+        "-maxrate",
+        _ffmpeg_bitrate_string(cap_bps),
+        "-bufsize",
+        _ffmpeg_bitrate_string(buf_bps),
+        "-c:a",
+        "aac",
+        "-b:a",
+        str(os.environ.get("INSTAGRAM_AUDIO_BITRATE", INSTAGRAM_DEFAULT_AUDIO_BITRATE) or INSTAGRAM_DEFAULT_AUDIO_BITRATE),
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        output_path,
+    ]
+
+
 def build_ffmpeg_audio_trim_command(
     *,
     ffmpeg_bin: str,
@@ -527,15 +768,15 @@ def build_ffmpeg_audio_trim_command(
     end: str,
     output_path: str,
 ) -> list[str]:
+    start_s = _parse_ffmpeg_timestamp_to_seconds(start)
+    end_s = _parse_ffmpeg_timestamp_to_seconds(end)
     return [
         ffmpeg_bin,
         "-y",
-        "-ss",
-        start,
-        "-to",
-        end,
         "-i",
         input_path,
+        "-af",
+        f"atrim=start={start_s:.3f}:end={end_s:.3f},asetpts=PTS-STARTPTS",
         "-vn",
         "-acodec",
         "pcm_s16le",
@@ -859,6 +1100,87 @@ def _probe_media_summary(path: str) -> dict[str, Any]:
         "resolution": resolution,
         "audio_stream_present": audio_present,
     }
+
+
+def _probe_media_bitrate_bps(path: str) -> int:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=bit_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return 0
+    raw = str(proc.stdout or "").strip().splitlines()
+    if not raw:
+        return 0
+    try:
+        return int(float(raw[-1].strip()))
+    except Exception:
+        return 0
+
+
+def _normalize_source_clip_if_needed(
+    *,
+    ffmpeg_bin: str,
+    source_path: str,
+    output_path: str,
+    fps: int,
+    aspect: str,
+) -> str:
+    src = Path(source_path)
+    if not src.exists():
+        raise RuntimeError(f"Source clip missing before normalization: {source_path}")
+    src_bytes = int(src.stat().st_size)
+    src_bitrate = _probe_media_bitrate_bps(str(src))
+    over_size = src_bytes > _instagram_source_max_bytes()
+    over_bitrate = src_bitrate > _instagram_source_max_bitrate_bps()
+    normalize_all = str(os.environ.get("PERFORMANCE_NORMALIZE_SOURCE_CLIPS", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not normalize_all and not (over_size or over_bitrate):
+        return str(src)
+    reason = "forced_normalize" if normalize_all else "oversized_or_high_bitrate"
+    print(
+        "performance_source_normalize_start "
+        f"reason={reason} source={source_path} bytes={src_bytes} bitrate_bps={src_bitrate}"
+    )
+    cmd = build_ffmpeg_instagram_normalize_command(
+        ffmpeg_bin=ffmpeg_bin,
+        input_path=str(src),
+        output_path=output_path,
+        fps=fps,
+        aspect=aspect,
+        include_audio=False,
+    )
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "performance source normalization failed "
+            f"source={source_path} output={output_path} "
+            f"returncode={proc.returncode} stderr={str(proc.stderr or '').strip()}"
+        )
+    out = Path(output_path)
+    if not out.exists() or out.stat().st_size <= 0:
+        raise RuntimeError(
+            "performance source normalization produced no output "
+            f"source={source_path} output={output_path}"
+        )
+    out_bitrate = _probe_media_bitrate_bps(str(out))
+    print(
+        "performance_source_normalize_done "
+        f"source={source_path} output={output_path} bytes={int(out.stat().st_size)} bitrate_bps={out_bitrate}"
+    )
+    _delete_local_file_best_effort(str(src))
+    return str(out)
 
 
 def _emit_media_summary_event(*, path: str, stage: str, cut_idx: int) -> None:
@@ -1327,6 +1649,64 @@ def build_vse_stitcher_command(job: dict, *, blender_bin: str, script_path: str)
     return cmd
 
 
+def build_vse_performance_command(job: dict, *, blender_bin: str, script_path: str) -> list[str]:
+    timeline_offset_seconds = _to_float(job.get("timeline_offset_seconds"), 0.0)
+    sync_mode = str(job.get("sync_mode") or "timeline_locked").strip().lower() or "timeline_locked"
+    short_clip_policy = str(job.get("short_clip_policy") or "wrap_loop").strip().lower() or "wrap_loop"
+    cmd = [
+        blender_bin,
+        "-b",
+        "--python",
+        script_path,
+        "--",
+        "--audio",
+        str(job["input_audio_path"]).strip(),
+        "--fps",
+        str(job["fps"]).strip(),
+        "--aspect",
+        str(job["aspect"]).strip(),
+        "--preset",
+        str(job["performance_preset"]).strip(),
+        "--seed",
+        str(job.get("seed") or "").strip() or "1",
+        "--timeline-offset-seconds",
+        f"{timeline_offset_seconds:.6f}",
+        "--sync-mode",
+        sync_mode,
+        "--short-clip-policy",
+        short_clip_policy,
+        "--output",
+        str(job["output_local_path"]).strip(),
+    ]
+    clip_map = job.get("clip_map") if isinstance(job.get("clip_map"), dict) else {}
+    for label in ("a", "b", "c", "d", "e", "f"):
+        path = str(clip_map.get(label) or "").strip()
+        if path:
+            cmd.extend([f"--clip-{label}", path])
+    render_end_seconds = _to_float(job.get("render_end_seconds", ""), 0.0)
+    if render_end_seconds > 0.0:
+        cmd.extend(["--render-end-seconds", f"{render_end_seconds:.3f}"])
+    return cmd
+
+
+def _performance_preset_sync_mode() -> str:
+    mode = str(os.environ.get("PERFORMANCE_PRESET_SYNC_MODE", "timeline_locked") or "").strip().lower()
+    if mode not in {"timeline_locked", "legacy_random"}:
+        raise RuntimeError(
+            "Invalid PERFORMANCE_PRESET_SYNC_MODE; expected one of: timeline_locked, legacy_random."
+        )
+    return mode
+
+
+def _performance_preset_short_clip_policy() -> str:
+    policy = str(os.environ.get("PERFORMANCE_PRESET_SHORT_CLIP_POLICY", "wrap_loop") or "").strip().lower()
+    if policy not in {"wrap_loop", "clamp", "fail"}:
+        raise RuntimeError(
+            "Invalid PERFORMANCE_PRESET_SHORT_CLIP_POLICY; expected one of: wrap_loop, clamp, fail."
+        )
+    return policy
+
+
 def build_vse_effects_command(job: dict, *, blender_bin: str, script_path: str) -> list[str]:
     cmd = [
         blender_bin,
@@ -1469,6 +1849,27 @@ def _local_path_from_artifact_row(row: dict[str, Any]) -> str:
     return str(row.get("notes") or "").replace("local_path=", "", 1).strip()
 
 
+def _artifact_is_mutable_for_upload_verify(artifact_type: str) -> bool:
+    return str(artifact_type or "").strip().lower() == "pipeline_events_jsonl"
+
+
+def _refresh_artifact_row_file_metrics(row: dict[str, Any], *, local_path: str) -> int:
+    num_bytes, digest = _file_bytes_sha256(local_path)
+    row["bytes"] = int(num_bytes)
+    row["sha256"] = str(digest)
+    return int(num_bytes)
+
+
+def _expected_upload_verify_bytes(row: dict[str, Any], *, local_path: str, artifact_type: str) -> int:
+    expected = _to_int(row.get("bytes"), 0)
+    if _artifact_is_mutable_for_upload_verify(artifact_type):
+        try:
+            expected = _refresh_artifact_row_file_metrics(row, local_path=local_path)
+        except Exception:
+            expected = _to_int(row.get("bytes"), 0)
+    return int(expected)
+
+
 def _delete_local_file_best_effort(path: str) -> None:
     raw = str(path or "").strip()
     if not raw:
@@ -1564,7 +1965,11 @@ def _upload_confirm_record_and_delete(
 
     if verify_mode != "size":
         raise RuntimeError(f"Unsupported PIPELINE_UPLOAD_VERIFY_MODE: {verify_mode}")
-    expected_bytes = _to_int(row.get("bytes"), 0)
+    expected_bytes = _expected_upload_verify_bytes(
+        row,
+        local_path=local_path,
+        artifact_type=artifact_type,
+    )
     try:
         client.confirm_upload_size(drive_file_id, expected_bytes)
     except Exception as exc:
@@ -1607,7 +2012,8 @@ def _upload_confirm_record_and_delete(
         )
         raise
 
-    _delete_local_file_best_effort(local_path)
+    if not _artifact_is_mutable_for_upload_verify(artifact_type):
+        _delete_local_file_best_effort(local_path)
     _emit_event(
         event="upload_end",
         stage="upload",
@@ -2227,13 +2633,6 @@ def run_once() -> int:
             )
             artifacts_written = append_outputs_index_rows(gw, control_sheet_id, artifact_rows)
         elif renderer == "pipeline_v1":
-            _require_job_field(job, "stitch_preset", renderer=renderer)
-            _require_job_field(job, "seed", renderer=renderer)
-            _require_job_field(job, "preset", renderer=renderer)
-            _require_job_field(job, "fps", renderer=renderer)
-            _require_job_field(job, "aspect", renderer=renderer)
-            _require_job_field(job, "bg_mode", renderer=renderer)
-
             resolved = resolve_and_download_pipeline_v1_inputs(job, run_id)
             paths = resolved["paths"]
             events_jsonl = str(Path(paths["logs"]) / "events.jsonl")
@@ -2242,6 +2641,7 @@ def run_once() -> int:
             paths["diagnostics"] = str(Path(paths["root"]) / "diagnostics")
             pipeline_paths_for_cleanup = dict(paths)
             manifest = resolved["manifest"]
+            edit_mode = resolve_pipeline_edit_mode(manifest, job)
             song_title_overlay = resolve_song_title_overlay(manifest, job)
             stage_plan = plan_pipeline_v1_stages(manifest, resolved)
             main_lyrics_cues = _require_nonempty_srt(
@@ -2293,6 +2693,435 @@ def run_once() -> int:
                 pipeline_diag_drive_folder_id = drive_folder_id
                 pipeline_diag_campaign_id = campaign_id
                 pipeline_diag_verify_mode = verify_mode
+
+            if edit_mode == EDIT_MODE_PERFORMANCE:
+                _require_job_field(job, "preset", renderer=renderer)
+                _require_job_field(job, "fps", renderer=renderer)
+                _require_job_field(job, "aspect", renderer=renderer)
+                _require_job_field(job, "bg_mode", renderer=renderer)
+                performance_fps = max(1, _to_int(job.get("fps"), 30))
+                performance_aspect = str(job.get("aspect") or "9:16").strip() or "9:16"
+                if performance_aspect not in {"9:16", "9x16", "vertical"}:
+                    print(f"performance_aspect_override from={performance_aspect} to=9:16")
+                    performance_aspect = "9:16"
+                performance_cfg = manifest.get("performance", {}) if isinstance(manifest, dict) else {}
+                if not isinstance(performance_cfg, dict):
+                    performance_cfg = {}
+                performance_mode = resolve_pipeline_performance_mode(manifest, job)
+                audio_policy = str(performance_cfg.get("audio_policy") or "master_only").strip().lower()
+                if audio_policy not in {"master_only", ""}:
+                    raise RuntimeError(f"Unsupported performance audio_policy={audio_policy!r}; expected master_only.")
+
+                performance_clip_paths: dict[str, str] = {}
+                if performance_mode == PERFORMANCE_MODE_SIMPLE:
+                    master_clip_id = str(performance_cfg.get("master_clip_drive_file_id") or "").strip()
+                    if not master_clip_id:
+                        raise RuntimeError("performance simple_sync_cut mode requires master_clip_drive_file_id.")
+                    master_raw_path = str(Path(paths["clips"]) / "performance_master_raw.mp4")
+                    master_path = str(Path(paths["clips"]) / "performance_master.mp4")
+                    _download_with_fallback(master_clip_id, master_raw_path)
+                    performance_clip_paths["a"] = _normalize_source_clip_if_needed(
+                        ffmpeg_bin=ffmpeg_bin,
+                        source_path=master_raw_path,
+                        output_path=master_path,
+                        fps=performance_fps,
+                        aspect=performance_aspect,
+                    )
+                else:
+                    clip_ids = performance_cfg.get("clips", {}) if isinstance(performance_cfg.get("clips"), dict) else {}
+                    for label in ("a", "b", "c", "d", "e", "f"):
+                        clip_id = str(clip_ids.get(label) or "").strip()
+                        if not clip_id:
+                            continue
+                        clip_raw_path = str(Path(paths["clips"]) / f"performance_{label}_raw.mp4")
+                        clip_path = str(Path(paths["clips"]) / f"performance_{label}.mp4")
+                        _download_with_fallback(clip_id, clip_raw_path)
+                        performance_clip_paths[label] = _normalize_source_clip_if_needed(
+                            ffmpeg_bin=ffmpeg_bin,
+                            source_path=clip_raw_path,
+                            output_path=clip_path,
+                            fps=performance_fps,
+                            aspect=performance_aspect,
+                        )
+                    if not (2 <= len(performance_clip_paths) <= 6):
+                        raise RuntimeError("performance preset mode requires between 2 and 6 labeled clips (a-f).")
+
+                cut_logs: list[str] = []
+                local_shorts: list[str] = []
+                artifacts_written = 0
+                if not normalized_cuts:
+                    raise RuntimeError("pipeline_v1 performance mode requires at least one valid manifest cut.")
+                performance_sync_mode = _performance_preset_sync_mode()
+                performance_short_clip_policy = _performance_preset_short_clip_policy()
+
+                for i, cut in enumerate(normalized_cuts, start=1):
+                    start = str(cut.get("start") or "").strip()
+                    end = str(cut.get("end") or "").strip()
+                    filename = str(cut.get("filename") or f"short_{i:03d}.mp4").strip()
+                    if not start or not end:
+                        raise RuntimeError(f"performance cut missing start/end at index={i}")
+                    start_s = _parse_ffmpeg_timestamp_to_seconds(start)
+                    end_s = _parse_ffmpeg_timestamp_to_seconds(end)
+                    if end_s <= start_s:
+                        raise RuntimeError(f"performance cut end <= start for filename={filename}: {start} -> {end}")
+                    cut_duration = max(0.01, end_s - start_s)
+                    cut_expected_frames = max(1, int(round(cut_duration * float(job.get("fps") or 30))))
+                    cut_prefix = f"cut_{i:02d}"
+                    cut_audio_path = str(Path(paths["outputs"]) / f"{cut_prefix}_audio.wav")
+                    cut_base_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_base.mp4")
+                    cut_lyrics_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_lyrics.mp4")
+                    cut_final_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_final.mp4")
+                    out_short = str(Path(paths["outputs"]) / filename)
+                    cut_audio_log = str(Path(paths["logs"]) / f"{cut_prefix}_audio.log")
+                    cut_base_log = str(Path(paths["logs"]) / f"{cut_prefix}_performance.log")
+                    cut_lyrics_log = str(Path(paths["logs"]) / f"{cut_prefix}_lyrics.log")
+                    cut_copy_log = str(Path(paths["logs"]) / f"{cut_prefix}_copy.log")
+                    cut_normalize_log = str(Path(paths["logs"]) / f"{cut_prefix}_normalize.log")
+                    cut_lyrics_srt = str(Path(paths["inputs"]) / f"{cut_prefix}_lyrics.srt")
+                    cut_copy_srt = str(Path(paths["inputs"]) / f"{cut_prefix}_copy.srt")
+                    cut_normalized_mp4 = str(Path(paths["outputs"]) / f"{cut_prefix}_normalized.mp4")
+
+                    _run_to_log(
+                        build_ffmpeg_audio_trim_command(
+                            ffmpeg_bin=ffmpeg_bin,
+                            input_path=resolved["audio_path"],
+                            start=start,
+                            end=end,
+                            output_path=cut_audio_path,
+                        ),
+                        cut_audio_log,
+                        stage=f"perf_audio:{filename}",
+                        cut_idx=i,
+                    )
+
+                    if performance_mode == PERFORMANCE_MODE_SIMPLE:
+                        master_path = str(performance_clip_paths.get("a") or "").strip()
+                        if not master_path:
+                            raise RuntimeError("Missing downloaded master clip for simple performance mode.")
+                        _run_to_log(
+                            build_ffmpeg_master_audio_cut_command(
+                                ffmpeg_bin=ffmpeg_bin,
+                                video_input_path=master_path,
+                                audio_input_path=resolved["audio_path"],
+                                start=start,
+                                end=end,
+                                output_path=cut_base_mp4,
+                                fps=int(_to_int(cut.get("fps"), performance_fps)),
+                                aspect=str(cut.get("aspect") or performance_aspect),
+                            ),
+                            cut_base_log,
+                            stage=f"performance_simple:{filename}",
+                            cut_idx=i,
+                            output_probe_path=cut_base_mp4,
+                        )
+                    else:
+                        cut_preset = (
+                            str(cut.get("performance_preset") or "").strip()
+                            or str(performance_cfg.get("preset") or "").strip()
+                            or str(job.get("performance_preset") or "").strip()
+                        )
+                        parsed_tokens = parse_performance_preset_tokens(cut_preset)
+                        required_labels = {str(t.get("clip") or "").strip().lower() for t in parsed_tokens}
+                        missing = sorted([x for x in required_labels if x and x not in performance_clip_paths])
+                        if missing:
+                            raise RuntimeError(
+                                f"performance preset references missing clip labels={missing}; "
+                                f"available={sorted(list(performance_clip_paths.keys()))}"
+                            )
+                        cut_job = {
+                            "input_audio_path": cut_audio_path,
+                            "fps": str(cut.get("fps") or job.get("fps") or ""),
+                            "aspect": str(cut.get("aspect") or job.get("aspect") or ""),
+                            "performance_preset": cut_preset,
+                            "seed": str(cut.get("seed") or job.get("seed") or "1"),
+                            "timeline_offset_seconds": f"{start_s:.6f}",
+                            "sync_mode": performance_sync_mode,
+                            "short_clip_policy": performance_short_clip_policy,
+                            "output_local_path": cut_base_mp4,
+                            "render_end_seconds": cut_duration,
+                            "clip_map": performance_clip_paths,
+                        }
+                        _run_to_log(
+                            build_vse_performance_command(
+                                cut_job,
+                                blender_bin=blender_bin,
+                                script_path=VSE_PERFORMANCE_SCRIPT_PATH,
+                            ),
+                            cut_base_log,
+                            stage=f"performance_preset:{filename}",
+                            cut_idx=i,
+                            retries=blender_stage_retries,
+                            retry_delay_seconds=blender_retry_delay_s,
+                            output_probe_path=cut_base_mp4,
+                        )
+                    _emit_media_summary_event(path=cut_base_mp4, stage=f"performance_base:{filename}", cut_idx=i)
+
+                    _slice_and_shift_srt_file(
+                        input_path=resolved["lyrics_srt_path"],
+                        output_path=cut_lyrics_srt,
+                        start_s=start_s,
+                        end_s=end_s,
+                    )
+                    cut_text_preset = str(cut.get("text_preset") or job.get("preset") or "").strip()
+                    cut_bg_mode = str(cut.get("bg_mode") or job.get("bg_mode") or "").strip()
+                    lyrics_cues = _count_srt_cues(cut_lyrics_srt)
+                    if lyrics_cues <= 0 and main_lyrics_cues > 0 and not _allow_empty_lyrics_srt():
+                        raise RuntimeError(
+                            "performance cut has zero lyric cues after slicing "
+                            f"(filename={filename} start={start} end={end} main_lyrics_cues={main_lyrics_cues})."
+                        )
+                    selected_source = cut_base_mp4
+                    selected_log = cut_lyrics_log
+                    if lyrics_cues > 0:
+                        lyrics_job = {
+                            "input_video_path": cut_base_mp4,
+                            "input_srt_path": cut_lyrics_srt,
+                            "input_audio_path": cut_audio_path,
+                            "fps": str(cut.get("fps") or job.get("fps") or ""),
+                            "aspect": str(cut.get("aspect") or job.get("aspect") or ""),
+                            "preset": cut_text_preset,
+                            "bg_mode": cut_bg_mode,
+                            "output_local_path": cut_lyrics_mp4,
+                            "render_end_seconds": cut_duration,
+                            "display_song_name": song_title_overlay["enabled"],
+                            "song_name": song_title_overlay["text"],
+                        }
+                        _run_to_log(
+                            build_vse_text_command(lyrics_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH),
+                            cut_lyrics_log,
+                            stage=f"performance_lyrics:{filename}",
+                            cut_idx=i,
+                            retries=blender_stage_retries,
+                            retry_delay_seconds=blender_retry_delay_s,
+                            output_probe_path=cut_lyrics_mp4,
+                        )
+                        selected_source = cut_lyrics_mp4
+                    else:
+                        shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
+                        Path(cut_lyrics_log).write_text("lyrics_fallback=copy_base reason=empty_lyrics_srt\n", encoding="utf-8")
+                        selected_source = cut_lyrics_mp4
+                    _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
+
+                    has_copy = "copy" in stage_plan and str(resolved.get("copy_srt_path") or "").strip()
+                    if has_copy:
+                        _slice_and_shift_srt_file(
+                            input_path=str(resolved.get("copy_srt_path") or ""),
+                            output_path=cut_copy_srt,
+                            start_s=start_s,
+                            end_s=end_s,
+                        )
+                        copy_cues = _count_srt_cues(cut_copy_srt)
+                        if copy_cues > 0:
+                            copy_job = {
+                                "input_video_path": selected_source,
+                                "input_srt_path": cut_copy_srt,
+                                "input_audio_path": cut_audio_path,
+                                "fps": str(cut.get("fps") or job.get("fps") or ""),
+                                "aspect": str(cut.get("aspect") or job.get("aspect") or ""),
+                                "preset": cut_text_preset,
+                                "bg_mode": cut_bg_mode,
+                                "output_local_path": cut_final_mp4,
+                                "render_end_seconds": cut_duration,
+                            }
+                            _run_to_log(
+                                build_vse_text_command(copy_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH),
+                                cut_copy_log,
+                                stage=f"performance_copy:{filename}",
+                                cut_idx=i,
+                                retries=blender_stage_retries,
+                                retry_delay_seconds=blender_retry_delay_s,
+                                output_probe_path=cut_final_mp4,
+                            )
+                            selected_source = cut_final_mp4
+                            selected_log = cut_copy_log
+
+                    source_label = "copy" if (selected_source == cut_final_mp4 and has_copy) else "lyrics"
+                    selected_for_duration = _pick_cut_source_video(
+                        base_mp4=cut_base_mp4,
+                        candidate_mp4=selected_source,
+                        max_cut_end_s=cut_duration,
+                        candidate_label=source_label,
+                        candidate_log_path=selected_log,
+                    )
+                    if selected_for_duration != selected_source:
+                        with Path(selected_log).open("a", encoding="utf-8") as lf:
+                            lf.write("\n")
+                            lf.write(
+                                "video_fallback=use_base_for_short_overlay_output "
+                                f"required_cut_end_s={cut_duration:.3f}\n"
+                            )
+                        selected_source = selected_for_duration
+
+                    if selected_source == cut_base_mp4:
+                        # Master-cut outputs can keep source cadence (for example 24fps) while
+                        # job/display fps is 30. When we intentionally fall back to base, gate
+                        # against actual base frames to avoid false short-frame failures.
+                        cut_expected_frames = max(1, _probe_media_video_frame_count(cut_base_mp4))
+
+                    _run_to_log(
+                        build_ffmpeg_instagram_normalize_command(
+                            ffmpeg_bin=ffmpeg_bin,
+                            input_path=selected_source,
+                            output_path=cut_normalized_mp4,
+                            fps=int(_to_int(cut.get("fps"), performance_fps)),
+                            aspect=str(cut.get("aspect") or performance_aspect),
+                            include_audio=True,
+                        ),
+                        cut_normalize_log,
+                        stage=f"performance_normalize:{filename}",
+                        cut_idx=i,
+                        output_probe_path=cut_normalized_mp4,
+                    )
+                    selected_source = cut_normalized_mp4
+                    selected_log = cut_normalize_log
+                    if selected_source != out_short:
+                        shutil.copy2(selected_source, out_short)
+                    _assert_expected_cut_output(
+                        output_path=out_short,
+                        expected_duration_s=cut_duration,
+                        expected_frames=cut_expected_frames,
+                        stage=f"performance_short:{filename}",
+                        cut_idx=i,
+                    )
+                    _emit_media_summary_event(path=out_short, stage=f"performance_short:{filename}", cut_idx=i)
+                    cut_logs.append(selected_log)
+                    _EVENT_SUMMARY["cuts_attempted"] = int(_EVENT_SUMMARY.get("cuts_attempted", 0)) + 1
+                    _EVENT_SUMMARY["cuts_succeeded"] = int(_EVENT_SUMMARY.get("cuts_succeeded", 0)) + 1
+
+                    if is_drive_output:
+                        if client is None:
+                            raise RuntimeError("Drive client is required for output_mode=drive")
+                        short_row = _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=str(job.get("campaign_id") or ""),
+                            artifact_type=f"pipeline_short_{i:02d}",
+                            file_path=out_short,
+                            created_utc=_utc_now_iso(),
+                        )
+                        short_artifact_type = str(short_row.get("artifact_type") or "")
+                        short_filename = str(short_row.get("filename") or "")
+                        if should_upload_artifact(
+                            existing_rows,
+                            run_id=run_id,
+                            artifact_type=short_artifact_type,
+                            filename=short_filename,
+                        ):
+                            short_row = _upload_confirm_record_and_delete(
+                                gw=gw,
+                                control_sheet_id=control_sheet_id,
+                                client=client,
+                                artifact_row=short_row,
+                                drive_folder_id=drive_folder_id,
+                                verify_mode=verify_mode,
+                            )
+                        else:
+                            existing = _find_existing_uploaded_artifact(
+                                existing_rows,
+                                run_id=run_id,
+                                artifact_type=short_artifact_type,
+                                filename=short_filename,
+                            )
+                            if existing:
+                                short_row["drive_file_id"] = str(existing.get("drive_file_id") or "")
+                                short_row["drive_folder_id"] = str(existing.get("drive_folder_id") or drive_folder_id)
+                            append_outputs_index_rows(gw, control_sheet_id, [short_row])
+                            _delete_local_file_best_effort(out_short)
+                        artifacts_written += 1
+                        existing_rows.append(short_row)
+                    else:
+                        local_shorts.append(out_short)
+
+                    for transient in (
+                        cut_audio_path,
+                        cut_lyrics_srt,
+                        cut_copy_srt,
+                        cut_base_mp4,
+                        cut_lyrics_mp4,
+                        cut_final_mp4,
+                        cut_normalized_mp4,
+                    ):
+                        if transient and transient != out_short:
+                            _delete_local_file_best_effort(transient)
+
+                created = _utc_now_iso()
+                artifact_rows: list[dict[str, Any]] = []
+                if not is_drive_output:
+                    for i, short_path in enumerate(local_shorts, start=1):
+                        artifact_rows.append(
+                            _build_output_row_from_file(
+                                run_id=run_id,
+                                render_job_id=render_job_id,
+                                campaign_id=str(job.get("campaign_id") or ""),
+                                artifact_type=f"pipeline_short_{i:02d}",
+                                file_path=short_path,
+                                created_utc=created,
+                            )
+                        )
+                    for i, log_path in enumerate(cut_logs, start=1):
+                        artifact_rows.append(
+                            _build_output_row_from_file(
+                                run_id=run_id,
+                                render_job_id=render_job_id,
+                                campaign_id=str(job.get("campaign_id") or ""),
+                                artifact_type=f"pipeline_cut_log_{i:02d}",
+                                file_path=log_path,
+                                created_utc=created,
+                            )
+                        )
+                events_path = _event_log_path()
+                if events_path and Path(events_path).exists():
+                    events_row = _build_output_row_from_file(
+                        run_id=run_id,
+                        render_job_id=render_job_id,
+                        campaign_id=str(job.get("campaign_id") or ""),
+                        artifact_type="pipeline_events_jsonl",
+                        file_path=events_path,
+                        created_utc=created,
+                    )
+                    if is_drive_output and client is not None:
+                        _upload_confirm_record_and_delete(
+                            gw=gw,
+                            control_sheet_id=control_sheet_id,
+                            client=client,
+                            artifact_row=events_row,
+                            drive_folder_id=drive_folder_id,
+                            verify_mode=verify_mode,
+                        )
+                        artifacts_written += 1
+                    else:
+                        artifact_rows.append(events_row)
+                if artifact_rows:
+                    artifacts_written += append_outputs_index_rows(gw, control_sheet_id, artifact_rows)
+                pipeline_run_succeeded = True
+
+                finished = _utc_now_iso()
+                mark_success(gw, control_sheet_id, render_job_id, run_id, now_utc=finished)
+                run_row["status"] = RENDER_STATUS_SUCCESS
+                run_row["finished_utc"] = finished
+                run_row["updated_utc"] = finished
+                run_row["artifacts_written"] = artifacts_written
+                upsert_render_run(gw, control_sheet_id, run_row)
+                _emit_event(
+                    event="run_end",
+                    stage="run",
+                    message="render run succeeded",
+                    code="",
+                    artifacts_written=int(artifacts_written),
+                    summary=dict(_EVENT_SUMMARY),
+                )
+                print(
+                    f"Render run success: run_id={run_id} render_job_id={render_job_id} "
+                    f"artifacts_written={artifacts_written}"
+                )
+                return 0
+
+            _require_job_field(job, "stitch_preset", renderer=renderer)
+            _require_job_field(job, "seed", renderer=renderer)
+            _require_job_field(job, "preset", renderer=renderer)
+            _require_job_field(job, "fps", renderer=renderer)
+            _require_job_field(job, "aspect", renderer=renderer)
+            _require_job_field(job, "bg_mode", renderer=renderer)
 
             per_cut_render = _pipeline_per_cut_render_enabled()
 
@@ -3028,7 +3857,12 @@ def run_once() -> int:
                         local_path = str(row.get("notes") or "").replace("local_path=", "", 1)
                         drive_file_id = client.upload_file(local_path, drive_folder_id, _guess_mime_type(local_path))
                         if verify_mode == "size":
-                            client.confirm_upload_size(drive_file_id, _to_int(row.get("bytes"), 0))
+                            expected_bytes = _expected_upload_verify_bytes(
+                                row,
+                                local_path=local_path,
+                                artifact_type=artifact_type,
+                            )
+                            client.confirm_upload_size(drive_file_id, expected_bytes)
                         else:
                             raise RuntimeError(f"Unsupported PIPELINE_UPLOAD_VERIFY_MODE: {verify_mode}")
                         row["drive_file_id"] = drive_file_id

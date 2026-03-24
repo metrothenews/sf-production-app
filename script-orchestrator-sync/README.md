@@ -8,6 +8,85 @@ Sync utility that reads rows from a source sheet, applies mapping rules from a c
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 
+## Performance Mode
+
+Pipeline v1 now supports two edit modes:
+- `found_footage` (existing behavior)
+- `performance` (new)
+
+`performance` supports two sub-modes:
+- `simple_sync_cut`: one full performance clip + master audio, then per-cut short exports.
+- `preset`: 2-6 labeled clips (`a`-`f`) cut by a performance preset DSL.
+
+Render mode fields are read from config row (compiler input):
+- `Render Mode`: `found_footage | performance` (default: `found_footage`)
+- `Performance Mode`: `simple_sync_cut | preset` (optional when `Render Mode=performance`)
+- `Performance Master Clip File ID` (required for `simple_sync_cut`)
+- `Performance Clip A File ID` ... `Performance Clip F File ID` (optional explicit mapping for `preset`)
+- `Performance Preset` (fallback preset DSL for `preset` mode)
+- `Performance Source Folder ID` (optional; default: `YOUR_GOOGLE_SHEET_ID`)
+
+Compiler fallback behavior for performance mode:
+- If `Performance Mode` is blank and any performance preset DSL exists (config fallback or Executive Preset column B), compiler auto-infers `preset`.
+- If `Performance Mode` is blank and no performance preset DSL exists, compiler uses `simple_sync_cut`.
+- In inferred/explicit `preset` mode, if no explicit A-F clip ids are provided, compiler auto-maps labels from the first 2-6 video files in `Performance Source Folder ID` (deterministic filename order).
+
+Compatibility aliases accepted by compiler input:
+- config-style (`Render Mode`, `Performance Mode`, `Performance Preset`, etc.)
+- snake_case (`render_mode`, `performance_mode`, `performance_preset_dsl`, etc.)
+
+Performance clip resolution behavior:
+- Drive ids and Drive URLs are accepted directly.
+- Non-id clip refs are resolved by exact filename inside `Performance Source Folder ID`.
+- Name resolution can be disabled with `PERFORMANCE_CLIP_NAME_RESOLUTION=0` (id/url only mode).
+
+Executive preset sheet columns (`Executive Preset File ID`) are interpreted as:
+- Column A: found-footage stitch preset (`FF Presets`)
+- Column B: performance preset DSL (`Performance Presets`)
+- Column C: text/lyrics preset (`Lyric Presets`)
+
+Performance preset DSL grammar:
+- Repeated tokens: `<duration><clip><modifiers>`
+- `duration`: positive integer
+- `clip`: one letter `a`..`f`
+- `modifiers`: optional `r` (reverse), `b` (black flash), `w` (white flash)
+- Example: `4a2br2cw`
+
+Performance mode config template (single data row example):
+
+```text
+Render Mode = performance
+Performance Mode = preset
+Performance Master Clip File ID = 
+Performance Clip A File ID = 1abc...A
+Performance Clip B File ID = 1abc...B
+Performance Clip C File ID = 1abc...C
+Performance Clip D File ID = 1abc...D
+Performance Clip E File ID = 
+Performance Clip F File ID = 
+Performance Preset = 4a2br2cw
+Audio File ID = 1audio...
+lyrics .srt File ID = 1lyrics...
+copy. srt File ID = 1copy...   # optional
+Cut Clips? = TRUE
+Clip 1 = TRUE
+Clip 1 Start = 00:00:12:44
+Clip 1 End = 00:00:24:48
+Clip 2 = TRUE
+Clip 2 Start = 00:00:26:12
+Clip 2 End = 00:00:32:24
+```
+
+Manifest schema:
+- `schema_version: pipeline_v1@2`
+- top-level `edit_mode`
+- top-level `performance` block for performance-specific settings
+
+`Render_Jobs` now includes trailing columns:
+- `edit_mode`
+- `performance_mode`
+- `performance_preset`
+
 ## Deep Observability + Forensics
 
 Pipeline v1 now supports structured run telemetry and auto-forensics on failure.
@@ -417,6 +496,17 @@ Goal:
 - Avoid repeated Drive download costs during renders by mirroring clips into GCS.
 - Render pipeline reads clips from GCS mirror (`gcs_mirror` mode) instead of pulling clip media from Drive each run.
 
+Key mode behavior:
+- Default compile/render source is `drive` unless you explicitly set `CLIPS_LIBRARY_SOURCE=gcs_mirror`.
+- Mirror freshness is warn-only (`CLIPS_LIBRARY_MIRROR_WARN_STALE_HOURS`).
+- Missing mirrored clip object at render time is hard-fail (no clip fallback to Drive).
+
+Recommended operator lifecycle:
+1. Curate clip folders/files in Drive (`collection-<number>` structure).
+2. Run mirror refresh (`make library-mirror-refresh-dry`, then `make library-mirror-refresh`).
+3. Run compile/render in `gcs_mirror` mode.
+4. If needed, rollback source with `CLIPS_LIBRARY_SOURCE=drive`.
+
 Mirror refresh command:
 
 ```bash
@@ -424,6 +514,7 @@ cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
 export CLIPS_LIBRARY_FOLDER_ID=YOUR_GOOGLE_SHEET_ID
 export CLIPS_LIBRARY_MIRROR_BUCKET=<your-bucket>
 export CLIPS_LIBRARY_MIRROR_PREFIX=library-mirror
+export CLIPS_LIBRARY_MIRROR_QUARANTINE_TTL_DAYS=7
 make library-mirror-refresh
 ```
 
@@ -433,6 +524,7 @@ Dry run:
 cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
 export CLIPS_LIBRARY_FOLDER_ID=YOUR_GOOGLE_SHEET_ID
 export CLIPS_LIBRARY_MIRROR_BUCKET=<your-bucket>
+export CLIPS_LIBRARY_MIRROR_PREFIX=library-mirror
 make library-mirror-refresh-dry
 ```
 
@@ -479,6 +571,11 @@ Rollback:
 ```bash
 export CLIPS_LIBRARY_SOURCE=drive
 ```
+
+Troubleshooting signals:
+- Compile warning: `mirror_freshness_warn ...` means index is older than warning threshold.
+- Compile hard-fail: `Mirror category coverage check failed before queueing render job ...`
+- Render hard-fail: GCS clip download errors are terminal for the run (`clip_download_source=gcs ...` followed by error).
 
 ## Happy Path Entrypoints
 
@@ -581,6 +678,87 @@ Behavior:
 CONTROL_SHEET_ID=<fixture_sheet_id> make smoke
 ```
 
+## SO Campaigns Migration (Staging -> Production)
+
+This migration updates only `SO Campaigns` with non-breaking performance-mode columns.
+
+Target sheets:
+- staging: `YOUR_GOOGLE_SHEET_ID`
+- production: `YOUR_GOOGLE_SHEET_ID`
+
+New trailing columns added by migration:
+- `render_mode`
+- `performance_mode`
+- `performance_audio_policy`
+- `performance_master_clip_drive_file_id`
+- `performance_clip_a_drive_file_id`
+- `performance_clip_b_drive_file_id`
+- `performance_clip_c_drive_file_id`
+- `performance_clip_d_drive_file_id`
+- `performance_clip_e_drive_file_id`
+- `performance_clip_f_drive_file_id`
+- `performance_preset_dsl`
+
+Backfill compatibility defaults:
+- if `render_mode` empty and `edit_mode=FF_ONLY`: set `render_mode=found_footage`
+- if `render_mode` empty and `edit_mode=FF_PLUS_PERF`: set `render_mode=performance`
+- if `render_mode=performance` and `performance_mode` empty: set `simple_sync_cut`
+- if `render_mode=performance` and `performance_audio_policy` empty: set `master_only`
+
+Read-only audit:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+SHEET_ID=YOUR_GOOGLE_SHEET_ID \
+PROD_TAB='SO Campaigns' \
+SAMPLE_ROWS=25 \
+python3 scripts/audit_so_campaigns_schema.py
+```
+
+Dry-run migration:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+SHEET_ID=YOUR_GOOGLE_SHEET_ID \
+PROD_TAB='SO Campaigns' \
+APPLY=0 \
+python3 scripts/migrate_so_campaigns_performance_mode.py
+```
+
+Apply migration:
+
+```bash
+cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync
+SHEET_ID=YOUR_GOOGLE_SHEET_ID \
+PROD_TAB='SO Campaigns' \
+APPLY=1 \
+python3 scripts/migrate_so_campaigns_performance_mode.py
+```
+
+Production run uses the same commands with:
+- `SHEET_ID=YOUR_GOOGLE_SHEET_ID`
+
+Promotion model:
+- run full audit + dry-run + apply sequence on staging
+- repeat on production
+- keep staging as pre-prod for future schema/data changes
+
+Rollback:
+- this migration is append-only for headers and non-destructive for non-empty cells
+- rollback path is value-level correction (re-run migration with adjusted defaults or update target cells)
+- no column deletion/reorder is performed by scripts
+
+Dual-write intake sync:
+- `scripts/sync_intake_to_so.py` now writes legacy fields and new performance-mode fields together
+- `performance_mode` defaults to `preset` when a performance preset exists, otherwise `simple_sync_cut`
+- clip-id columns are only written when explicit intake values are provided
+- intake default tab is now `mode` with a leftmost `Mode` column (`found footage | performance | hybrid`)
+- when `INTAKE_TAB=mode` (or legacy `api-read`), the script routes to:
+  - `found-footage-mode`
+  - `performance-footage-mode`
+  - `hybrid-mode`
+  and reads that mode tab row as the primary source (with non-empty control-tab fallback during migration)
+
 ## Render Jobs v0 (noop renderer)
 
 Required tabs in the CONTROL sheet:
@@ -654,12 +832,21 @@ CONTROL_SHEET_ID=<your_control_sheet_id> make compile-config
 
 Optional env vars:
 - `CONFIG_SHEET_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
-- `CONFIG_TAB` (default: `Sheet1`)
+- `CONFIG_TAB` (default: `mode`)
 - `CONFIG_RANGE` (default: `A1:ZZ2`)
 - `CLIPS_LIBRARY_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `OUTPUT_PARENT_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `ASSETS_FOLDER_ID` (optional folder used for filename->Drive id lookup)
+- `PERFORMANCE_SOURCE_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
+- `PERFORMANCE_CLIP_NAME_RESOLUTION` (default: `1`; set `0` to require ids/urls for performance clips)
+- `FOUND_FOOTAGE_MODE_TAB` (default: `found-footage-mode`)
+- `PERFORMANCE_MODE_TAB` (default: `performance-footage-mode`)
+- `HYBRID_MODE_TAB` (default: `hybrid-mode`)
+- `MODE_CONTROL_TAB` (default: `mode`; legacy `api-read` is also accepted)
 - `PIPELINE_STITCH_BPM` (fallback BPM when config has no BPM value; default `120`)
+
+When `CONFIG_TAB=mode` (or legacy `api-read`), compiler reads leftmost `Mode` and routes to the matching
+mode tab above, using mode-tab values as primary and control-tab values as non-empty fallback.
 
 Category inference used by compiler:
 - Folder/file names are scanned for common tokens and normalized to category keys.

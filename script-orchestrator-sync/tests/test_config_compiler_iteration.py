@@ -34,8 +34,171 @@ def test_normalize_text_preset_name() -> None:
     assert compiler._normalize_text_preset_name("") == ""
 
 
+def test_normalize_edit_mode_defaults_to_found_footage() -> None:
+    assert compiler.normalize_edit_mode("") == "found_footage"
+    assert compiler.normalize_edit_mode("performance") == "performance"
+    with pytest.raises(RuntimeError, match=r"Invalid Render Mode"):
+        compiler.normalize_edit_mode("nope")
+
+
+def test_resolve_render_mode_from_cfg_uses_backfill_defaults() -> None:
+    assert compiler._resolve_render_mode_from_cfg({"edit_mode": "FF_ONLY"}) == "found_footage"
+    assert compiler._resolve_render_mode_from_cfg({"edit_mode": "FF_PLUS_PERF"}) == "performance"
+    assert compiler._resolve_render_mode_from_cfg({"render_mode": "performance"}) == "performance"
+
+
+def test_resolve_render_mode_from_cfg_falls_back_to_mode_column() -> None:
+    assert compiler._resolve_render_mode_from_cfg({"Mode": "performance"}) == "performance"
+    assert compiler._resolve_render_mode_from_cfg({"Mode": "hybrid"}) == "performance"
+    assert compiler._resolve_render_mode_from_cfg({"Mode": "found footage"}) == "found_footage"
+
+
+def test_normalize_performance_mode() -> None:
+    assert compiler.normalize_performance_mode("simple_sync_cut") == "simple_sync_cut"
+    assert compiler.normalize_performance_mode("preset") == "preset"
+    with pytest.raises(RuntimeError, match=r"Invalid Performance Mode"):
+        compiler.normalize_performance_mode("bad_mode")
+
+
+def test_resolve_performance_mode_from_cfg_defaults_simple_sync_cut() -> None:
+    assert compiler._resolve_performance_mode_from_cfg({}, render_mode="found_footage") == ""
+    assert compiler._resolve_performance_mode_from_cfg({}, render_mode="performance") == "simple_sync_cut"
+    assert (
+        compiler._resolve_performance_mode_from_cfg({"performance_mode": "preset"}, render_mode="performance")
+        == "preset"
+    )
+
+
+def test_resolve_performance_mode_from_cfg_honors_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("PERFORMANCE_MODE_OVERRIDE", "preset")
+    assert compiler._resolve_performance_mode_from_cfg({}, render_mode="performance") == "preset"
+
+
+def test_resolve_performance_audio_policy_defaults_master_only() -> None:
+    assert compiler._resolve_performance_audio_policy_from_cfg({}, render_mode="performance") == "master_only"
+    assert (
+        compiler._resolve_performance_audio_policy_from_cfg(
+            {"performance_audio_policy": "master_only"},
+            render_mode="performance",
+        )
+        == "master_only"
+    )
+    with pytest.raises(RuntimeError, match=r"Invalid performance audio policy"):
+        compiler._resolve_performance_audio_policy_from_cfg(
+            {"performance_audio_policy": "mixed"},
+            render_mode="performance",
+        )
+
+
+def test_parse_performance_preset_tokens() -> None:
+    out = compiler.parse_performance_preset_tokens("4a2br2cw")
+    assert out[0] == {"duration": 4, "clip": "a", "modifiers": ""}
+    assert out[1] == {"duration": 2, "clip": "b", "modifiers": "r"}
+    assert out[2] == {"duration": 2, "clip": "c", "modifiers": "w"}
+    with pytest.raises(RuntimeError, match=r"Unsupported performance preset modifier"):
+        compiler.parse_performance_preset_tokens("4az")
+
+
+def test_performance_preset_field_alias_plural() -> None:
+    cfg = {"Performance Presets": "4a2br2cw"}
+    raw = compiler._cfg_value_by_names(cfg, compiler.PERFORMANCE_PRESET_FIELD_NAMES, default="")
+    assert str(raw) == "4a2br2cw"
+
+
+def test_parse_performance_clip_map() -> None:
+    cfg = {
+        "Performance Clip A File ID": "A" * 22,
+        "Performance Clip B File ID": "B" * 22,
+    }
+    out = compiler._parse_performance_clip_map(cfg)
+    assert out == {"a": "A" * 22, "b": "B" * 22}
+    with pytest.raises(RuntimeError, match=r"must be a Drive file id"):
+        compiler._parse_performance_clip_map({"Performance Clip A File ID": "not-an-id"})
+
+
+def test_parse_performance_clip_map_reads_snake_case_aliases() -> None:
+    cfg = {
+        "performance_clip_a_drive_file_id": "A" * 22,
+        "performance_clip_b_drive_file_id": "B" * 22,
+    }
+    out = compiler._parse_performance_clip_map(cfg)
+    assert out == {"a": "A" * 22, "b": "B" * 22}
+
+
+def test_parse_performance_clip_map_auto_resolves_from_source_folder(monkeypatch) -> None:
+    monkeypatch.setenv("PERFORMANCE_PRESET_AUTO_CLIPS", "1")
+
+    class _Drive:
+        def list_files_in_folder(self, _folder_id: str):
+            return [
+                {"id": "B" * 22, "name": "clip_b.mp4", "mimeType": "video/mp4"},
+                {"id": "A" * 22, "name": "clip_a.mp4", "mimeType": "video/mp4"},
+                {"id": "Z" * 22, "name": "notes.txt", "mimeType": "text/plain"},
+            ]
+
+    out = compiler._parse_performance_clip_map(
+        {},
+        drive_client=_Drive(),
+        source_folder_id="folder_abc",
+        listing_cache={},
+    )
+    assert out == {"a": "A" * 22, "b": "B" * 22}
+
+
 def test_config_range_default_covers_shifted_columns() -> None:
     assert compiler.CONFIG_RANGE_DEFAULT == "A1:ZZ2"
+
+
+def test_config_tab_default_is_mode() -> None:
+    assert compiler.CONFIG_TAB_DEFAULT == "mode"
+
+
+def test_mode_to_tab_name() -> None:
+    assert compiler._mode_to_tab_name("found footage") == "found-footage-mode"
+    assert compiler._mode_to_tab_name("performance") == "performance-footage-mode"
+    assert compiler._mode_to_tab_name("hybrid") == "hybrid-mode"
+    assert compiler._mode_to_tab_name("unknown") == ""
+
+
+def test_read_config_row_routes_mode_tab_with_control_fallback() -> None:
+    class _FakeGateway:
+        def read(self, _sheet_id: str, ranges: list[str]):
+            rng = ranges[0]
+            if "'mode'!A1:ZZ2" == rng:
+                return {
+                    "valueRanges": [
+                        {
+                            "values": [
+                                ["Mode", "Render Mode", "Audio File ID"],
+                                ["performance", "found_footage", "audio_id_from_api_1234567890"],
+                            ]
+                        }
+                    ]
+                }
+            if "'performance-footage-mode'!A1:ZZ2" == rng:
+                return {
+                    "valueRanges": [
+                        {
+                            "values": [
+                                ["Render Mode", "Number of Videos", "Naming Convention", "Audio File ID"],
+                                ["performance", "6", "Campaign Z", ""],
+                            ]
+                        }
+                    ]
+                }
+            raise AssertionError(f"Unexpected range {rng}")
+
+    out = compiler._read_config_row(
+        _FakeGateway(),
+        "sheet_x",
+        "mode",
+        "A1:ZZ2",
+    )
+    assert out["Mode"] == "performance"
+    assert out["_mode_source_tab"] == "performance-footage-mode"
+    assert out["Render Mode"] == "performance"
+    assert out["Number of Videos"] == "6"
+    assert out["Audio File ID"] == "audio_id_from_api_1234567890"
 
 
 def test_resolve_stitch_bpm_prefers_song_bpm_column() -> None:
@@ -47,6 +210,13 @@ def test_resolve_song_title_overlay_enabled() -> None:
     cfg = {"Display Song Name?": "TRUE", "Song Name": "Track Name"}
     out = compiler.resolve_song_title_overlay(cfg)
     assert out == {"enabled": True, "text": "Track Name"}
+
+
+def test_resolve_song_title_overlay_honors_disable_override(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY_SONG_NAME_OVERRIDE", "0")
+    cfg = {"Display Song Name?": "TRUE", "Song Name": "Track Name"}
+    out = compiler.resolve_song_title_overlay(cfg)
+    assert out == {"enabled": False, "text": ""}
 
 
 def test_resolve_song_title_overlay_requires_text_when_enabled() -> None:
@@ -74,7 +244,12 @@ def test_read_preset_rows_from_sheet1_layout() -> None:
                     {
                         "values": [
                             ["FF Presets", "Performance Presets", "Lyric Presets", "Copy Presets"],
-                            ["1p1u1f1c1m1t", "", "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007.py", ""],
+                            [
+                                "1p1u1f1c1m1t",
+                                "4a2br2cw",
+                                "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007.py",
+                                "",
+                            ],
                             [],
                             ["2p2u2c2t2m2f", "", "", ""],
                         ]
@@ -87,12 +262,83 @@ def test_read_preset_rows_from_sheet1_layout() -> None:
         {
             "stitch_preset": "1p1u1f1c1m1t",
             "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+            "performance_preset": "4a2br2cw",
         },
         {
             "stitch_preset": "2p2u2c2t2m2f",
             "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+            "performance_preset": "4a2br2cw",
         },
     ]
+
+
+def test_autofill_performance_presets_column_when_all_blank() -> None:
+    class _FakeGateway:
+        def __init__(self) -> None:
+            self.updates = []
+
+        def read(self, _sheet_id: str, _ranges: list[str]):
+            return {
+                "valueRanges": [
+                    {
+                        "values": [
+                            ["FF Presets", "Performance Presets", "Lyric Presets"],
+                            ["4p4c4f4t2p2u2c2m", "", "text_preset_a.py"],
+                            ["4p4sbc4f4t2sp2u2c2wm", "", "text_preset_b.py"],
+                        ]
+                    }
+                ]
+            }
+
+        def write(self, _sheet_id: str, updates: list[dict[str, object]]):
+            self.updates = list(updates)
+            return {"ok": True}
+
+    gw = _FakeGateway()
+    filled = compiler._autofill_performance_presets_column(
+        gw,
+        "sheet_id",
+        tab="Sheet1",
+        fill_value="4a2br2cw",
+    )
+    assert filled == 2
+    assert gw.updates == [
+        {"range": "'Sheet1'!B2", "values": [["4a2br2cw"]]},
+        {"range": "'Sheet1'!B3", "values": [["4a2br2cw"]]},
+    ]
+
+
+def test_autofill_performance_presets_column_skips_when_any_present() -> None:
+    class _FakeGateway:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def read(self, _sheet_id: str, _ranges: list[str]):
+            return {
+                "valueRanges": [
+                    {
+                        "values": [
+                            ["FF Presets", "Performance Presets", "Lyric Presets"],
+                            ["4p4c4f4t2p2u2c2m", "4a2br2cw", "text_preset_a.py"],
+                            ["4p4sbc4f4t2sp2u2c2wm", "", "text_preset_b.py"],
+                        ]
+                    }
+                ]
+            }
+
+        def write(self, _sheet_id: str, _updates: list[dict[str, object]]):
+            self.write_calls += 1
+            return {"ok": True}
+
+    gw = _FakeGateway()
+    filled = compiler._autofill_performance_presets_column(
+        gw,
+        "sheet_id",
+        tab="Sheet1",
+        fill_value="4a2br2cw",
+    )
+    assert filled == 0
+    assert gw.write_calls == 0
 
 
 def test_non_multiple_video_count_trims_last_iteration() -> None:

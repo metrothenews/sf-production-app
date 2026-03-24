@@ -53,6 +53,9 @@ RENDER_CANONICAL_HEADERS: Mapping[str, List[str]] = {
         "seed",
         "copy_srt_drive_file_id",
         "bpm",
+        "edit_mode",
+        "performance_mode",
+        "performance_preset",
     ],
     OUTPUTS_INDEX_TAB: [
         "output_id",
@@ -106,4 +109,7 @@ RENDER_HEADER_ALIASES: Mapping[str, List[str]] = {
     "select_mode": ["select mode"],
     "select_seed": ["select seed"],
     "output_folder_id": ["output folder id"],
+    "edit_mode": ["edit mode", "render mode"],
+    "performance_mode": ["performance mode"],
+    "performance_preset": ["performance preset"],
 }
