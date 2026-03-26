@@ -1196,6 +1196,30 @@ def _emit_media_summary_event(*, path: str, stage: str, cut_idx: int) -> None:
     )
 
 
+def _materialize_video_fallback_output(
+    *,
+    output_path: str,
+    source_path: str,
+    log_path: str = "",
+    note: str = "",
+) -> bool:
+    out = Path(output_path)
+    needs_fallback = True
+    if out.exists():
+        try:
+            needs_fallback = out.stat().st_size <= 0
+        except Exception:
+            needs_fallback = True
+    if not needs_fallback:
+        return False
+    shutil.copy2(source_path, output_path)
+    if log_path:
+        with Path(log_path).open("a", encoding="utf-8") as lf:
+            lf.write("\n")
+            lf.write(f"{note or 'stage_fallback'}\n")
+    return True
+
+
 def _assert_expected_cut_output(
     *,
     output_path: str,
@@ -3627,11 +3651,12 @@ def run_once() -> int:
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
                         )
-                        if not Path(cut_lyrics_mp4).exists():
-                            shutil.copy2(source_for_lyrics, cut_lyrics_mp4)
-                            with Path(cut_lyrics_log).open("a", encoding="utf-8") as lf:
-                                lf.write("\n")
-                                lf.write("lyrics_fallback=copy_source reason=missing_lyrics_output\n")
+                        _materialize_video_fallback_output(
+                            output_path=cut_lyrics_mp4,
+                            source_path=source_for_lyrics,
+                            log_path=cut_lyrics_log,
+                            note="lyrics_fallback=copy_source reason=missing_or_empty_lyrics_output",
+                        )
                         if shared_auto_baseline_wps <= 0.0:
                             shared_auto_baseline_wps = _extract_reveal_auto_speed_baseline_from_log(cut_lyrics_log)
                             if shared_auto_baseline_wps > 0.0:
@@ -3639,12 +3664,25 @@ def run_once() -> int:
                                     "per_cut_reveal_auto_anchor "
                                     f"cut_idx={i} filename={filename} baseline_wps={shared_auto_baseline_wps:.3f}"
                                 )
-                        _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
+                        try:
+                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
+                        except RuntimeError as exc:
+                            msg = str(exc)
+                            if "ffprobe failed for" not in msg:
+                                raise
+                            _materialize_video_fallback_output(
+                                output_path=cut_lyrics_mp4,
+                                source_path=source_for_lyrics,
+                                log_path=cut_lyrics_log,
+                                note="lyrics_fallback=copy_source reason=ffprobe_probe_failed",
+                            )
+                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
                     else:
-                        shutil.copy2(source_for_lyrics, cut_lyrics_mp4)
-                        Path(cut_lyrics_log).write_text(
-                            "lyrics_fallback=copy_source reason=empty_lyrics_srt\n",
-                            encoding="utf-8",
+                        _materialize_video_fallback_output(
+                            output_path=cut_lyrics_mp4,
+                            source_path=source_for_lyrics,
+                            log_path=cut_lyrics_log,
+                            note="lyrics_fallback=copy_source reason=empty_lyrics_srt",
                         )
                         _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
 
@@ -3679,11 +3717,12 @@ def run_once() -> int:
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_final_stage_mp4,
                         )
-                        if not Path(cut_final_stage_mp4).exists():
-                            shutil.copy2(cut_lyrics_mp4, cut_final_stage_mp4)
-                            with Path(cut_copy_log).open("a", encoding="utf-8") as lf:
-                                lf.write("\n")
-                                lf.write("copy_fallback=use_lyrics reason=missing_copy_output\n")
+                        _materialize_video_fallback_output(
+                            output_path=cut_final_stage_mp4,
+                            source_path=cut_lyrics_mp4,
+                            log_path=cut_copy_log,
+                            note="copy_fallback=use_lyrics reason=missing_or_empty_copy_output",
+                        )
                         _emit_media_summary_event(path=cut_final_stage_mp4, stage=f"copy:{filename}", cut_idx=i)
                         selected_cut_source = cut_final_stage_mp4
                         selected_copy_log = cut_copy_log
