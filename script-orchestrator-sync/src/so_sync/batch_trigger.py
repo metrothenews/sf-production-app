@@ -164,6 +164,9 @@ def build_batch_create_request(
         "SHEETS_JSON_API_KEY": cfg.sheets_json_api_key,
         "REQUIRE_RENDER_BINARIES": cfg.require_render_binaries,
     }
+    text_preset_override = str(os.environ.get("TEXT_PRESET_OVERRIDE", "")).strip()
+    if text_preset_override:
+        env_vars["TEXT_PRESET_OVERRIDE"] = text_preset_override
     key_file = str(cfg.drive_sa_key_file or "").strip()
     if key_file:
         env_vars["DRIVE_SA_KEY_FILE"] = key_file

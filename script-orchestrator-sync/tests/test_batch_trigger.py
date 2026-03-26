@@ -27,7 +27,8 @@ def test_summarize_render_queue_state_counts_active_and_queued(monkeypatch) -> N
     assert state["queued_job_ids"] == ["job_queued", "job_retry"]
 
 
-def test_build_batch_create_request_has_expected_command_and_env() -> None:
+def test_build_batch_create_request_has_expected_command_and_env(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT_PRESET_OVERRIDE", "brat_words_manual_lightgrey_narrow_pixelate_v007_option2")
     cfg = BatchTriggerConfig(
         project_id="proj_1",
         region="us-east1",
@@ -65,6 +66,7 @@ def test_build_batch_create_request_has_expected_command_and_env() -> None:
     assert "--max-rounds 40" in command
     env_vars = req["job"]["task_groups"][0]["task_spec"]["environment"]["variables"]
     assert env_vars["CONTROL_SHEET_ID"] == "sheet_1"
+    assert env_vars["TEXT_PRESET_OVERRIDE"] == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
     assert env_vars["DRIVE_SA_KEY_FILE"] == "/secrets/drive-sa.json"
     assert env_vars["DRIVE_SA_KEY_JSON"] == "{\"type\":\"service_account\"}"
     assert env_vars["GOOGLE_APPLICATION_CREDENTIALS"] == "/secrets/drive-sa.json"
