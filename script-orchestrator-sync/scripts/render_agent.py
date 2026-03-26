@@ -2969,12 +2969,35 @@ def run_once() -> int:
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
                         )
+                        _materialize_video_fallback_output(
+                            output_path=cut_lyrics_mp4,
+                            source_path=cut_base_mp4,
+                            log_path=cut_lyrics_log,
+                            note="lyrics_fallback=copy_base reason=missing_or_empty_lyrics_output",
+                        )
                         selected_source = cut_lyrics_mp4
                     else:
-                        shutil.copy2(cut_base_mp4, cut_lyrics_mp4)
-                        Path(cut_lyrics_log).write_text("lyrics_fallback=copy_base reason=empty_lyrics_srt\n", encoding="utf-8")
+                        _materialize_video_fallback_output(
+                            output_path=cut_lyrics_mp4,
+                            source_path=cut_base_mp4,
+                            log_path=cut_lyrics_log,
+                            note="lyrics_fallback=copy_base reason=empty_lyrics_srt",
+                        )
                         selected_source = cut_lyrics_mp4
-                    _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
+                    try:
+                        _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
+                    except RuntimeError as exc:
+                        msg = str(exc)
+                        if "ffprobe failed for" not in msg:
+                            raise
+                        _materialize_video_fallback_output(
+                            output_path=cut_lyrics_mp4,
+                            source_path=cut_base_mp4,
+                            log_path=cut_lyrics_log,
+                            note="lyrics_fallback=copy_base reason=ffprobe_probe_failed",
+                        )
+                        selected_source = cut_lyrics_mp4
+                        _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
 
                     has_copy = "copy" in stage_plan and str(resolved.get("copy_srt_path") or "").strip()
                     if has_copy:
@@ -3005,6 +3028,12 @@ def run_once() -> int:
                                 retries=blender_stage_retries,
                                 retry_delay_seconds=blender_retry_delay_s,
                                 output_probe_path=cut_final_mp4,
+                            )
+                            _materialize_video_fallback_output(
+                                output_path=cut_final_mp4,
+                                source_path=selected_source,
+                                log_path=cut_copy_log,
+                                note="copy_fallback=use_lyrics reason=missing_or_empty_copy_output",
                             )
                             selected_source = cut_final_mp4
                             selected_log = cut_copy_log
