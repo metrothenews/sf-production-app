@@ -38,6 +38,12 @@ def test_parse_performance_preset_tokens() -> None:
     assert out[2] == {"duration": 2, "clip": "c", "modifiers": "w"}
 
 
+def test_parse_performance_preset_tokens_accepts_decimal_durations() -> None:
+    out = render_agent.parse_performance_preset_tokens("0.5a1.5br")
+    assert out[0] == {"duration": 0.5, "clip": "a", "modifiers": ""}
+    assert out[1] == {"duration": 1.5, "clip": "b", "modifiers": "r"}
+
+
 def test_build_vse_performance_command_contains_clip_args(tmp_path: Path) -> None:
     out_mp4 = tmp_path / "out.mp4"
     clip_a = tmp_path / "a.mp4"
@@ -48,7 +54,9 @@ def test_build_vse_performance_command_contains_clip_args(tmp_path: Path) -> Non
             "fps": "30",
             "aspect": "9:16",
             "performance_preset": "4a2br2cw",
+            "bpm": "136",
             "seed": "42",
+            "timing_mode": "beat_cuts",
             "timeline_offset_seconds": "7.23",
             "sync_mode": "timeline_locked",
             "short_clip_policy": "wrap_loop",
@@ -64,6 +72,18 @@ def test_build_vse_performance_command_contains_clip_args(tmp_path: Path) -> Non
     assert "--preset" in cmd
     assert "4a2br2cw" in cmd
     assert "--render-end-seconds" in cmd
+    assert "--bpm" in cmd
     assert "--timeline-offset-seconds" in cmd
+    assert "--timing-mode" in cmd
     assert "--sync-mode" in cmd
     assert "--short-clip-policy" in cmd
+
+
+def test_performance_preset_timing_mode_env_default(monkeypatch) -> None:
+    monkeypatch.delenv("PERFORMANCE_PRESET_TIMING_MODE", raising=False)
+    assert render_agent._performance_preset_timing_mode() == "beat_cuts"
+
+
+def test_performance_preset_timing_mode_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("PERFORMANCE_PRESET_TIMING_MODE", "normalized")
+    assert render_agent._performance_preset_timing_mode() == "normalized"

@@ -71,8 +71,10 @@ EDIT_MODE_FOUND_FOOTAGE = "found_footage"
 EDIT_MODE_PERFORMANCE = "performance"
 PERFORMANCE_MODE_SIMPLE = "simple_sync_cut"
 PERFORMANCE_MODE_PRESET = "preset"
-PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+)([a-fA-F])([a-zA-Z]*)")
+PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)([a-fA-F])([a-zA-Z]*)")
 PERFORMANCE_PRESET_ALLOWED_MODIFIERS = {"r", "b", "w"}
+PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS = "beat_cuts"
+PERFORMANCE_PRESET_TIMING_MODE_NORMALIZED = "normalized"
 
 _EVENT_LOGGER: RenderEventLogger | None = None
 _EVENT_RUN_ID = ""
@@ -467,7 +469,7 @@ def parse_performance_preset_tokens(value: str) -> list[dict[str, Any]]:
         if not m:
             raise RuntimeError(f"Invalid performance preset token at offset {idx}: {raw!r}")
         duration_text, clip_label, modifiers_raw = m.groups()
-        duration = int(duration_text)
+        duration = float(duration_text)
         if duration <= 0:
             raise RuntimeError(f"Performance preset duration must be > 0: {raw!r}")
         clip = clip_label.lower()
@@ -1653,6 +1655,14 @@ def build_vse_performance_command(job: dict, *, blender_bin: str, script_path: s
     timeline_offset_seconds = _to_float(job.get("timeline_offset_seconds"), 0.0)
     sync_mode = str(job.get("sync_mode") or "timeline_locked").strip().lower() or "timeline_locked"
     short_clip_policy = str(job.get("short_clip_policy") or "wrap_loop").strip().lower() or "wrap_loop"
+    timing_mode = _normalize_performance_preset_timing_mode(
+        str(job.get("timing_mode") or _performance_preset_timing_mode())
+    )
+    bpm = str(job.get("bpm") or "").strip()
+    if not bpm:
+        bpm = str(job.get("stitch_bpm") or "").strip()
+    if not bpm:
+        bpm = os.environ.get("PIPELINE_STITCH_BPM", "120").strip() or "120"
     cmd = [
         blender_bin,
         "-b",
@@ -1667,8 +1677,12 @@ def build_vse_performance_command(job: dict, *, blender_bin: str, script_path: s
         str(job["aspect"]).strip(),
         "--preset",
         str(job["performance_preset"]).strip(),
+        "--bpm",
+        bpm,
         "--seed",
         str(job.get("seed") or "").strip() or "1",
+        "--timing-mode",
+        timing_mode,
         "--timeline-offset-seconds",
         f"{timeline_offset_seconds:.6f}",
         "--sync-mode",
@@ -1696,6 +1710,24 @@ def _performance_preset_sync_mode() -> str:
             "Invalid PERFORMANCE_PRESET_SYNC_MODE; expected one of: timeline_locked, legacy_random."
         )
     return mode
+
+
+def _normalize_performance_preset_timing_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in {PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS, PERFORMANCE_PRESET_TIMING_MODE_NORMALIZED}:
+        raise RuntimeError(
+            "Invalid performance preset timing mode; expected one of: beat_cuts, normalized "
+            f"(got {value!r})."
+        )
+    return mode
+
+
+def _performance_preset_timing_mode() -> str:
+    raw = str(
+        os.environ.get("PERFORMANCE_PRESET_TIMING_MODE", PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS)
+        or PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS
+    ).strip().lower()
+    return _normalize_performance_preset_timing_mode(raw)
 
 
 def _performance_preset_short_clip_policy() -> str:
@@ -2752,6 +2784,22 @@ def run_once() -> int:
                 if not normalized_cuts:
                     raise RuntimeError("pipeline_v1 performance mode requires at least one valid manifest cut.")
                 performance_sync_mode = _performance_preset_sync_mode()
+                performance_timing_mode = _normalize_performance_preset_timing_mode(
+                    str(performance_cfg.get("timing_mode") or _performance_preset_timing_mode())
+                )
+                performance_bpm = str(
+                    performance_cfg.get("bpm")
+                    or manifest.get("stitch", {}).get("bpm")
+                    or job.get("bpm")
+                    or ""
+                ).strip()
+                if not performance_bpm:
+                    performance_bpm = os.environ.get("PIPELINE_STITCH_BPM", "120").strip() or "120"
+                if _to_float(performance_bpm, 0.0) <= 0.0:
+                    raise RuntimeError(
+                        "performance preset mode requires a positive bpm "
+                        f"(resolved value={performance_bpm!r})."
+                    )
                 performance_short_clip_policy = _performance_preset_short_clip_policy()
 
                 for i, cut in enumerate(normalized_cuts, start=1):
@@ -2833,7 +2881,9 @@ def run_once() -> int:
                             "fps": str(cut.get("fps") or job.get("fps") or ""),
                             "aspect": str(cut.get("aspect") or job.get("aspect") or ""),
                             "performance_preset": cut_preset,
+                            "bpm": performance_bpm,
                             "seed": str(cut.get("seed") or job.get("seed") or "1"),
+                            "timing_mode": performance_timing_mode,
                             "timeline_offset_seconds": f"{start_s:.6f}",
                             "sync_mode": performance_sync_mode,
                             "short_clip_policy": performance_short_clip_policy,

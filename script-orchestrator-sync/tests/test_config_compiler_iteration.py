@@ -34,6 +34,42 @@ def test_normalize_text_preset_name() -> None:
     assert compiler._normalize_text_preset_name("") == ""
 
 
+def test_resolve_text_preset_override_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT_PRESET_OVERRIDE", "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007_option2.py")
+    value, source = compiler._resolve_text_preset_override_from_cfg({})
+    assert value == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert source == "env:TEXT_PRESET_OVERRIDE"
+
+
+def test_resolve_text_preset_override_from_config() -> None:
+    value, source = compiler._resolve_text_preset_override_from_cfg(
+        {
+            "Lyric Preset Override": "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007_option2.py",
+        }
+    )
+    assert value == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert source == "config:lyric_text_preset_override"
+
+
+def test_apply_text_preset_override_updates_preset_and_rows(capsys) -> None:
+    rows = [
+        {"stitch_preset": "4a4b4c", "text_preset": "old_a", "performance_preset": "4a4b4c"},
+        {"stitch_preset": "4a4b4c", "text_preset": "old_b", "performance_preset": "4a4b4c"},
+    ]
+    preset = {"text_preset": "default_v007"}
+    compiler._apply_text_preset_override(
+        dynamic_preset_rows=rows,
+        preset=preset,
+        text_preset_override="brat_words_manual_lightgrey_narrow_pixelate_v007_option2",
+        source="env:TEXT_PRESET_OVERRIDE",
+    )
+    assert preset["text_preset"] == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert rows[0]["text_preset"] == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert rows[1]["text_preset"] == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    out = capsys.readouterr().out
+    assert "text_preset_override_applied" in out
+
+
 def test_normalize_edit_mode_defaults_to_found_footage() -> None:
     assert compiler.normalize_edit_mode("") == "found_footage"
     assert compiler.normalize_edit_mode("performance") == "performance"
@@ -74,6 +110,16 @@ def test_resolve_performance_mode_from_cfg_honors_env_override(monkeypatch) -> N
     assert compiler._resolve_performance_mode_from_cfg({}, render_mode="performance") == "preset"
 
 
+def test_resolve_performance_preset_timing_mode_defaults_beat_cuts(monkeypatch) -> None:
+    monkeypatch.delenv("PERFORMANCE_PRESET_TIMING_MODE", raising=False)
+    assert compiler.resolve_performance_preset_timing_mode() == "beat_cuts"
+
+
+def test_resolve_performance_preset_timing_mode_honors_env(monkeypatch) -> None:
+    monkeypatch.setenv("PERFORMANCE_PRESET_TIMING_MODE", "normalized")
+    assert compiler.resolve_performance_preset_timing_mode() == "normalized"
+
+
 def test_resolve_performance_audio_policy_defaults_master_only() -> None:
     assert compiler._resolve_performance_audio_policy_from_cfg({}, render_mode="performance") == "master_only"
     assert (
@@ -95,6 +141,9 @@ def test_parse_performance_preset_tokens() -> None:
     assert out[0] == {"duration": 4, "clip": "a", "modifiers": ""}
     assert out[1] == {"duration": 2, "clip": "b", "modifiers": "r"}
     assert out[2] == {"duration": 2, "clip": "c", "modifiers": "w"}
+    out_decimal = compiler.parse_performance_preset_tokens("0.5a1.5br")
+    assert out_decimal[0] == {"duration": 0.5, "clip": "a", "modifiers": ""}
+    assert out_decimal[1] == {"duration": 1.5, "clip": "b", "modifiers": "r"}
     with pytest.raises(RuntimeError, match=r"Unsupported performance preset modifier"):
         compiler.parse_performance_preset_tokens("4az")
 

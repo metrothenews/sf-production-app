@@ -14,6 +14,12 @@ Pipeline v1 now supports two edit modes:
 - `found_footage` (existing behavior)
 - `performance` (new)
 
+### Update (2026-03-24)
+
+- Compiler now auto-infers `Performance Mode=preset` when the mode cell is blank but a performance preset DSL is present (from config fallback or Executive Preset column B).
+- In `preset` mode, when explicit `Performance Clip A..F File ID` values are missing, labels are auto-mapped from the first 2-6 videos in `Performance Source Folder ID` using deterministic filename ordering.
+- Mode-control routing remains sheet-driven (`Mode` in `mode` tab -> `performance-footage-mode` for performance runs).
+
 `performance` supports two sub-modes:
 - `simple_sync_cut`: one full performance clip + master audio, then per-cut short exports.
 - `preset`: 2-6 labeled clips (`a`-`f`) cut by a performance preset DSL.
@@ -45,11 +51,19 @@ Executive preset sheet columns (`Executive Preset File ID`) are interpreted as:
 - Column B: performance preset DSL (`Performance Presets`)
 - Column C: text/lyrics preset (`Lyric Presets`)
 
+Text preset override options (single switch for all queued jobs/cuts):
+- Config row field `Lyric Preset Override` (or `Text Preset Override`)
+- Env var `TEXT_PRESET_OVERRIDE`
+- Accepted values: `text_preset_<name>.py` or `<name>` (both normalize to `<name>`)
+
 Performance preset DSL grammar:
 - Repeated tokens: `<duration><clip><modifiers>`
-- `duration`: positive integer
+- `duration`: positive number (integer or decimal)
 - `clip`: one letter `a`..`f`
 - `modifiers`: optional `r` (reverse), `b` (black flash), `w` (white flash)
+- Default timing mode is beat-synced `beat_cuts`: token duration `N` means `N` cuts per 4-beat measure.
+- In `beat_cuts`, token sequence repeats across each cut and remains phase-locked to the full-song timeline.
+- Set `PERFORMANCE_PRESET_TIMING_MODE=normalized` to use legacy whole-cut normalized token weighting.
 - Example: `4a2br2cw`
 
 Performance mode config template (single data row example):
@@ -844,6 +858,7 @@ Optional env vars:
 - `HYBRID_MODE_TAB` (default: `hybrid-mode`)
 - `MODE_CONTROL_TAB` (default: `mode`; legacy `api-read` is also accepted)
 - `PIPELINE_STITCH_BPM` (fallback BPM when config has no BPM value; default `120`)
+- `PERFORMANCE_PRESET_TIMING_MODE` (default: `beat_cuts`; options: `beat_cuts`, `normalized`)
 
 When `CONFIG_TAB=mode` (or legacy `api-read`), compiler reads leftmost `Mode` and routes to the matching
 mode tab above, using mode-tab values as primary and control-tab values as non-empty fallback.
@@ -962,6 +977,10 @@ Use this when running from terminal on a local machine.
 cd /Users/samrooker/Desktop/sf-production-app/script-orchestrator-sync && \
 CONTROL_SHEET_ID=YOUR_GOOGLE_SHEET_ID \
 GOOGLE_APPLICATION_CREDENTIALS=/Users/samrooker/.config/gcloud/application_default_credentials.json \
+make run-batch
+
+# Optional: force one lyric preset for all cuts in this run
+TEXT_PRESET_OVERRIDE=brat_words_manual_lightgrey_narrow_pixelate_v007_option2 \
 make run-batch
 ```
 

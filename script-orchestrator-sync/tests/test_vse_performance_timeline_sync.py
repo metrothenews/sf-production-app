@@ -38,6 +38,101 @@ def test_allocate_token_frames_sums_exact() -> None:
     assert all(v >= 1 for v in out)
 
 
+def test_allocate_token_frames_supports_decimal_weights() -> None:
+    tokens = [
+        {"duration": 0.5, "clip": "a", "modifiers": ""},
+        {"duration": 1.5, "clip": "b", "modifiers": ""},
+    ]
+    out = perf._allocate_token_frames(tokens, 200)
+    assert sum(out) == 200
+    assert all(v >= 1 for v in out)
+    assert out[1] > out[0]
+
+
+def test_allocate_beat_cut_segments_sums_exact_and_is_deterministic() -> None:
+    tokens = [
+        {"duration": 1, "clip": "a", "modifiers": ""},
+        {"duration": 2, "clip": "b", "modifiers": ""},
+    ]
+    out_a = perf._allocate_beat_cut_segments(
+        tokens,
+        300,
+        timeline_offset_frames=137,
+        bpm=120.0,
+        fps=30,
+    )
+    out_b = perf._allocate_beat_cut_segments(
+        tokens,
+        300,
+        timeline_offset_frames=137,
+        bpm=120.0,
+        fps=30,
+    )
+    assert out_a == out_b
+    assert sum(int(item["token_frames"]) for item in out_a) == 300
+    assert all(int(item["token_frames"]) > 0 for item in out_a)
+
+
+def test_allocate_beat_cut_segments_allows_decimal_rates() -> None:
+    tokens = [
+        {"duration": 0.5, "clip": "a", "modifiers": ""},
+        {"duration": 1.5, "clip": "b", "modifiers": ""},
+    ]
+    out = perf._allocate_beat_cut_segments(
+        tokens,
+        240,
+        timeline_offset_frames=90,
+        bpm=128.0,
+        fps=30,
+    )
+    assert sum(int(item["token_frames"]) for item in out) == 240
+    assert all(int(item["token_frames"]) > 0 for item in out)
+
+
+def _expand_token_indices(segments: list[dict[str, int]]) -> list[int]:
+    out: list[int] = []
+    for seg in segments:
+        out.extend([int(seg["token_index"])] * int(seg["token_frames"]))
+    return out
+
+
+def test_allocate_beat_cut_segments_is_globally_phase_locked_across_cuts() -> None:
+    tokens = [
+        {"duration": 1, "clip": "a", "modifiers": ""},
+        {"duration": 2, "clip": "b", "modifiers": ""},
+        {"duration": 1, "clip": "c", "modifiers": ""},
+    ]
+    start = 100
+    cut_a_frames = 91
+    cut_b_frames = 149
+    bpm = 120.0
+    fps = 30
+
+    seg_a = perf._allocate_beat_cut_segments(
+        tokens,
+        cut_a_frames,
+        timeline_offset_frames=start,
+        bpm=bpm,
+        fps=fps,
+    )
+    seg_b = perf._allocate_beat_cut_segments(
+        tokens,
+        cut_b_frames,
+        timeline_offset_frames=start + cut_a_frames,
+        bpm=bpm,
+        fps=fps,
+    )
+    seg_whole = perf._allocate_beat_cut_segments(
+        tokens,
+        cut_a_frames + cut_b_frames,
+        timeline_offset_frames=start,
+        bpm=bpm,
+        fps=fps,
+    )
+
+    assert _expand_token_indices(seg_a) + _expand_token_indices(seg_b) == _expand_token_indices(seg_whole)
+
+
 def test_allocate_token_frames_rejects_impossible() -> None:
     tokens = [
         {"duration": 1, "clip": "a", "modifiers": ""},
@@ -52,6 +147,28 @@ def test_token_start_frames_from_timeline_offset() -> None:
     frames = [238, 120, 119]
     starts = perf._token_start_frames(217, frames)
     assert starts == [217, 455, 575]
+
+
+def test_build_token_timing_segments_normalized_matches_legacy_allocation() -> None:
+    tokens = [
+        {"duration": 4, "clip": "a", "modifiers": ""},
+        {"duration": 2, "clip": "b", "modifiers": ""},
+        {"duration": 2, "clip": "c", "modifiers": ""},
+    ]
+    total_frames = 477
+    offset = 217
+    legacy_frames = perf._allocate_token_frames(tokens, total_frames)
+    legacy_starts = perf._token_start_frames(offset, legacy_frames)
+    segments = perf._build_token_timing_segments(
+        tokens,
+        total_frames=total_frames,
+        timeline_offset_frames=offset,
+        timing_mode="normalized",
+        bpm=0.0,
+        fps=30,
+    )
+    assert [int(item["token_frames"]) for item in segments] == legacy_frames
+    assert [int(item["token_start_frame"]) for item in segments] == legacy_starts
 
 
 def test_plan_source_extraction_wrap_loop_crosses_clip_end() -> None:

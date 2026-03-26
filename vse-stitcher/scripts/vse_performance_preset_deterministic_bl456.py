@@ -10,14 +10,17 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Sequence
 
 
-TOKEN_RE = re.compile(r"(\d+)([a-fA-F])([a-zA-Z]*)")
+TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)([a-fA-F])([a-zA-Z]*)")
 ALLOWED_MODIFIERS = {"r", "b", "w"}
 SYNC_MODE_TIMELINE_LOCKED = "timeline_locked"
 SYNC_MODE_LEGACY_RANDOM = "legacy_random"
+TIMING_MODE_BEAT_CUTS = "beat_cuts"
+TIMING_MODE_NORMALIZED = "normalized"
 SHORT_CLIP_POLICY_WRAP_LOOP = "wrap_loop"
 SHORT_CLIP_POLICY_CLAMP = "clamp"
 SHORT_CLIP_POLICY_FAIL = "fail"
@@ -87,6 +90,23 @@ def _seconds_to_frames(seconds: float, fps: int) -> int:
     return max(0, int(round(max(0.0, float(seconds)) * float(max(1, int(fps))))))
 
 
+def beats_per_measure() -> int:
+    return 4
+
+
+def frames_per_beat(bpm: float, fps: int) -> Fraction:
+    if bpm <= 0:
+        raise RuntimeError(f"Invalid bpm; expected > 0 (got {bpm}).")
+    bpm_scaled = int(round(float(bpm) * 1000.0))
+    if bpm_scaled <= 0:
+        raise RuntimeError(f"Invalid bpm after scaling; expected > 0 (got {bpm}).")
+    return Fraction(int(fps) * 60, 1) / Fraction(bpm_scaled, 1000)
+
+
+def measure_frames(bpm: float, fps: int) -> Fraction:
+    return frames_per_beat(bpm, fps) * beats_per_measure()
+
+
 def _ffprobe_video_frame_count(path: str, fps: int) -> int:
     proc = subprocess.run(
         [
@@ -128,7 +148,7 @@ def _parse_preset(preset: str) -> list[dict[str, Any]]:
         if not m:
             raise RuntimeError(f"Invalid preset token at offset {idx}: {raw!r}")
         duration_text, clip_label, modifiers_raw = m.groups()
-        duration = int(duration_text)
+        duration = float(duration_text)
         if duration <= 0:
             raise RuntimeError(f"Preset duration must be > 0: {raw!r}")
         modifiers = str(modifiers_raw or "").lower()
@@ -151,7 +171,7 @@ def _allocate_token_frames(tokens: list[dict[str, Any]], total_frames: int) -> l
         raise RuntimeError(
             f"Token allocation impossible: total_frames={target} token_count={count} (need >= token_count)."
         )
-    weights = [max(0, int(t.get("duration") or 0)) for t in tokens]
+    weights = [max(0.0, float(t.get("duration") or 0.0)) for t in tokens]
     total_weight = sum(weights)
     if total_weight <= 0:
         raise RuntimeError("Token allocation requires positive total token duration weight.")
@@ -194,6 +214,101 @@ def _token_start_frames(timeline_offset_frames: int, token_frames: Sequence[int]
     return out
 
 
+def _allocate_beat_cut_segments(
+    tokens: list[dict[str, Any]],
+    total_frames: int,
+    *,
+    timeline_offset_frames: int,
+    bpm: float,
+    fps: int,
+) -> list[dict[str, int]]:
+    count = len(tokens)
+    if count <= 0:
+        raise RuntimeError("Beat timing requires at least one preset token.")
+    target = int(total_frames)
+    if target <= 0:
+        raise RuntimeError(f"Beat timing requires total_frames > 0 (got {target}).")
+
+    window_start = max(0, int(timeline_offset_frames))
+    window_end = window_start + target
+    cursor = 0
+    idx = 0
+    remainder = Fraction(0, 1)
+    mf = measure_frames(float(bpm), int(fps))
+    if mf <= 0:
+        raise RuntimeError(f"Invalid beat timing measure frame span computed from bpm={bpm} fps={fps}.")
+
+    out: list[dict[str, int]] = []
+    while cursor < window_end:
+        token = tokens[idx]
+        rate = float(token.get("duration") or 0.0)
+        if rate <= 0:
+            raise RuntimeError(f"Beat timing token rate must be > 0 (got {rate}).")
+        rate_fraction = Fraction(str(rate))
+        seg_len_f = (mf / rate_fraction) + remainder
+        seg_len_i = int(seg_len_f)  # floor
+        remainder = seg_len_f - seg_len_i
+        if seg_len_i <= 0:
+            seg_len_i = 1
+
+        seg_start = int(cursor)
+        seg_end = int(seg_start + seg_len_i)
+        overlap_start = max(seg_start, window_start)
+        overlap_end = min(seg_end, window_end)
+        overlap_frames = int(overlap_end - overlap_start)
+        if overlap_frames > 0:
+            out.append(
+                {
+                    "token_index": int(idx),
+                    "token_start_frame": int(overlap_start),
+                    "token_frames": overlap_frames,
+                }
+            )
+
+        cursor = seg_end
+        idx = (idx + 1) % count
+
+    assigned = sum(int(item["token_frames"]) for item in out)
+    if assigned != target:
+        raise RuntimeError(
+            "Beat timing allocation mismatch: "
+            f"expected_frames={target} actual_frames={assigned} offset_frames={window_start}"
+        )
+    if any(int(item.get("token_frames", 0)) <= 0 for item in out):
+        raise RuntimeError(f"Beat timing allocation produced non-positive segments: {out}")
+    return out
+
+
+def _build_token_timing_segments(
+    tokens: list[dict[str, Any]],
+    *,
+    total_frames: int,
+    timeline_offset_frames: int,
+    timing_mode: str,
+    bpm: float,
+    fps: int,
+) -> list[dict[str, int]]:
+    mode = _normalize_timing_mode(timing_mode)
+    if mode == TIMING_MODE_NORMALIZED:
+        token_frames = _allocate_token_frames(tokens, total_frames)
+        token_start_frames = _token_start_frames(timeline_offset_frames, token_frames)
+        return [
+            {
+                "token_index": int(idx),
+                "token_start_frame": int(token_start_frames[idx]),
+                "token_frames": int(token_frames[idx]),
+            }
+            for idx in range(len(tokens))
+        ]
+    return _allocate_beat_cut_segments(
+        tokens,
+        total_frames,
+        timeline_offset_frames=timeline_offset_frames,
+        bpm=bpm,
+        fps=fps,
+    )
+
+
 def _normalize_sync_mode(value: str) -> str:
     mode = str(value or "").strip().lower()
     if mode not in {SYNC_MODE_TIMELINE_LOCKED, SYNC_MODE_LEGACY_RANDOM}:
@@ -216,6 +331,16 @@ def _normalize_short_clip_policy(value: str) -> str:
             f"(got {value!r})."
         )
     return policy
+
+
+def _normalize_timing_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in {TIMING_MODE_BEAT_CUTS, TIMING_MODE_NORMALIZED}:
+        raise RuntimeError(
+            "Invalid timing mode; expected one of: beat_cuts, normalized "
+            f"(got {value!r})."
+        )
+    return mode
 
 
 def _flash_frame_count(modifiers: str, token_frames: int, fps: int) -> int:
@@ -532,10 +657,12 @@ def _mux_master_audio(*, video_path: str, audio_path: str, output_path: str) -> 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
+    ap.add_argument("--bpm", type=float, default=0.0)
     ap.add_argument("--fps", type=int, required=True)
     ap.add_argument("--aspect", required=True)
     ap.add_argument("--preset", required=True)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--timing-mode", default=TIMING_MODE_BEAT_CUTS)
     ap.add_argument("--timeline-offset-seconds", type=float, default=0.0)
     ap.add_argument("--sync-mode", default=SYNC_MODE_TIMELINE_LOCKED)
     ap.add_argument("--short-clip-policy", default=SHORT_CLIP_POLICY_WRAP_LOOP)
@@ -549,7 +676,11 @@ def main(argv: list[str] | None = None) -> int:
     if fps <= 0:
         raise RuntimeError(f"Invalid fps; expected > 0 (got {fps}).")
     sync_mode = _normalize_sync_mode(args.sync_mode)
+    timing_mode = _normalize_timing_mode(args.timing_mode)
     short_clip_policy = _normalize_short_clip_policy(args.short_clip_policy)
+    bpm = float(args.bpm)
+    if timing_mode == TIMING_MODE_BEAT_CUTS and bpm <= 0:
+        raise RuntimeError(f"Beat timing mode requires --bpm > 0 (got {bpm}).")
 
     clip_map: dict[str, str] = {}
     for label in ("a", "b", "c", "d", "e", "f"):
@@ -575,9 +706,15 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(
             f"Invalid cut duration after conversion to frames: target_duration={target_duration:.6f} fps={fps}"
         )
-    token_frames = _allocate_token_frames(tokens, cut_total_frames)
     timeline_offset_frames = _seconds_to_frames(float(args.timeline_offset_seconds), fps)
-    token_start_frames = _token_start_frames(timeline_offset_frames, token_frames)
+    token_segments = _build_token_timing_segments(
+        tokens,
+        total_frames=cut_total_frames,
+        timeline_offset_frames=timeline_offset_frames,
+        timing_mode=timing_mode,
+        bpm=bpm,
+        fps=fps,
+    )
 
     clip_frame_counts = {label: _ffprobe_video_frame_count(path, fps) for label, path in clip_map.items()}
     width, height = _aspect_to_resolution(args.aspect)
@@ -587,11 +724,12 @@ def main(argv: list[str] | None = None) -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     built_parts: list[str] = []
 
-    for idx, token in enumerate(tokens, start=1):
+    for idx, timed in enumerate(token_segments, start=1):
+        token = tokens[int(timed["token_index"])]
         clip_label = str(token.get("clip") or "").strip().lower()
         modifiers = str(token.get("modifiers") or "").lower()
-        token_total_frames = int(token_frames[idx - 1])
-        token_start_frame = int(token_start_frames[idx - 1])
+        token_total_frames = int(timed["token_frames"])
+        token_start_frame = int(timed["token_start_frame"])
         flash_color = "black" if "b" in modifiers else ("white" if "w" in modifiers else "")
         flash_frames = _flash_frame_count(modifiers, token_total_frames, fps)
         clip_frames_needed = token_total_frames - flash_frames
@@ -650,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             "performance_sync_token "
             f"idx={idx} "
             f"clip={clip_label} "
+            f"timing_mode={timing_mode} "
             f"mode={sync_mode} "
             f"policy={short_clip_policy} "
             f"token_frames={token_total_frames} "

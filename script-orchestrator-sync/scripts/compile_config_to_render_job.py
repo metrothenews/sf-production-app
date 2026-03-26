@@ -63,14 +63,27 @@ EDIT_MODE_FOUND_FOOTAGE = "found_footage"
 EDIT_MODE_PERFORMANCE = "performance"
 PERFORMANCE_MODE_SIMPLE = "simple_sync_cut"
 PERFORMANCE_MODE_PRESET = "preset"
-PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+)([a-fA-F])([a-zA-Z]*)")
+PERFORMANCE_PRESET_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)([a-fA-F])([a-zA-Z]*)")
 PERFORMANCE_PRESET_ALLOWED_MODIFIERS = {"r", "b", "w"}
+PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS = "beat_cuts"
+PERFORMANCE_PRESET_TIMING_MODE_NORMALIZED = "normalized"
 PERFORMANCE_PRESET_FIELD_NAMES = [
     "Performance Preset",
     "Performance Presets",
     "performance_preset_dsl",
     "performance_preset",
     "performance_presets",
+]
+TEXT_PRESET_FIELD_NAMES = [
+    "Lyric Preset Override",
+    "Text Preset Override",
+    "Lyric Preset",
+    "Lyric Presets",
+    "Text Preset",
+    "Text Presets",
+    "text_preset",
+    "text preset",
+    "lyric preset",
 ]
 EDIT_MODE_FF_ONLY = "FF_ONLY"
 EDIT_MODE_FF_PLUS_PERF = "FF_PLUS_PERF"
@@ -215,7 +228,7 @@ def parse_performance_preset_tokens(value: str) -> list[dict[str, Any]]:
         if not m:
             raise RuntimeError(f"Invalid performance preset token at offset {idx}: {raw!r}")
         duration_text, clip_label, modifiers_raw = m.groups()
-        duration = int(duration_text)
+        duration = float(duration_text)
         if duration <= 0:
             raise RuntimeError(f"Performance preset duration must be > 0: {raw!r}")
         modifiers = str(modifiers_raw or "").lower()
@@ -235,6 +248,19 @@ def parse_performance_preset_tokens(value: str) -> list[dict[str, Any]]:
 def normalize_performance_preset(value: Any) -> str:
     raw = str(value or "").strip()
     _ = parse_performance_preset_tokens(raw)
+    return raw
+
+
+def resolve_performance_preset_timing_mode() -> str:
+    raw = str(
+        os.environ.get("PERFORMANCE_PRESET_TIMING_MODE", PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS)
+        or PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS
+    ).strip().lower()
+    if raw not in {PERFORMANCE_PRESET_TIMING_MODE_BEAT_CUTS, PERFORMANCE_PRESET_TIMING_MODE_NORMALIZED}:
+        raise RuntimeError(
+            "Invalid PERFORMANCE_PRESET_TIMING_MODE; expected one of: beat_cuts, normalized "
+            f"(got {raw!r})."
+        )
     return raw
 
 
@@ -1151,6 +1177,37 @@ def _normalize_text_preset_name(raw: str) -> str:
     return text
 
 
+def _resolve_text_preset_override_from_cfg(cfg: Mapping[str, Any]) -> tuple[str, str]:
+    env_raw = str(os.environ.get("TEXT_PRESET_OVERRIDE", "") or "").strip()
+    env_norm = _normalize_text_preset_name(env_raw)
+    if env_norm:
+        return env_norm, "env:TEXT_PRESET_OVERRIDE"
+    cfg_raw = str(_cfg_value_by_names(cfg, TEXT_PRESET_FIELD_NAMES, default="") or "").strip()
+    cfg_norm = _normalize_text_preset_name(cfg_raw)
+    if cfg_norm:
+        return cfg_norm, "config:lyric_text_preset_override"
+    return "", ""
+
+
+def _apply_text_preset_override(
+    *,
+    dynamic_preset_rows: list[dict[str, str]],
+    preset: dict[str, Any],
+    text_preset_override: str,
+    source: str,
+) -> None:
+    override = str(text_preset_override or "").strip()
+    if not override:
+        return
+    preset["text_preset"] = override
+    for row in dynamic_preset_rows:
+        row["text_preset"] = override
+    print(
+        f"text_preset_override_applied source={source or 'unknown'} "
+        f"text_preset={override} rows_updated={len(dynamic_preset_rows)}"
+    )
+
+
 def _parse_performance_clip_map(
     cfg: Mapping[str, Any],
     *,
@@ -1417,11 +1474,12 @@ def main() -> int:
     if number_of_videos <= 0:
         raise RuntimeError(f"Number of Videos must be >= 1 (got {number_of_videos}).")
     exec_preset_name = str(cfg.get("Executive Preset") or "").strip()
-    preset = EXEC_PRESET_MAP.get(exec_preset_name)
-    if not preset:
+    preset_map = EXEC_PRESET_MAP.get(exec_preset_name)
+    if not preset_map:
         raise RuntimeError(
             f"Unknown Executive Preset '{exec_preset_name}'. Known presets={sorted(EXEC_PRESET_MAP.keys())}"
         )
+    preset = dict(preset_map)
     render_mode = _resolve_render_mode_from_cfg(cfg)
     performance_mode = _resolve_performance_mode_from_cfg(cfg, render_mode=render_mode)
     performance_audio_policy = _resolve_performance_audio_policy_from_cfg(cfg, render_mode=render_mode)
@@ -1472,6 +1530,8 @@ def main() -> int:
     stitch_bpm = resolve_stitch_bpm(cfg)
     timeline_fps = int(preset["fps"])
     performance_aspect = str(os.environ.get("PERFORMANCE_ASPECT", "9:16") or "9:16").strip() or "9:16"
+    performance_timing_mode = resolve_performance_preset_timing_mode()
+    text_preset_override, text_preset_override_source = _resolve_text_preset_override_from_cfg(cfg)
 
     base_cuts = build_cuts_from_config(
         cfg,
@@ -1506,6 +1566,12 @@ def main() -> int:
                 "performance_preset": performance_preset_fallback,
             }
         ]
+    _apply_text_preset_override(
+        dynamic_preset_rows=dynamic_preset_rows,
+        preset=preset,
+        text_preset_override=text_preset_override,
+        source=text_preset_override_source,
+    )
     if (
         render_mode == EDIT_MODE_PERFORMANCE
         and performance_mode == PERFORMANCE_MODE_SIMPLE
@@ -1637,6 +1703,8 @@ def main() -> int:
                     "master_clip_drive_file_id": performance_master_clip_id,
                     "clips": performance_clips,
                     "preset": selected_performance_preset if performance_mode == PERFORMANCE_MODE_PRESET else "",
+                    "timing_mode": performance_timing_mode,
+                    "bpm": stitch_bpm,
                     "source_folder_id": performance_source_folder_id,
                 },
                 "cuts": run_cuts_with_exec,
@@ -1811,6 +1879,12 @@ def main() -> int:
                 "performance_preset": performance_preset_fallback,
             }
         ]
+    _apply_text_preset_override(
+        dynamic_preset_rows=dynamic_preset_rows,
+        preset=preset,
+        text_preset_override=text_preset_override,
+        source=text_preset_override_source,
+    )
 
     base_job_id = _render_job_id(config_sheet_id, config_tab, row_index=2)
     queued_job_ids: list[str] = []
@@ -1984,6 +2058,8 @@ def main() -> int:
                 "master_clip_drive_file_id": "",
                 "clips": {},
                 "preset": "",
+                "timing_mode": performance_timing_mode,
+                "bpm": stitch_bpm,
                 "source_folder_id": "",
             },
             "cuts": run_cuts_with_exec,
