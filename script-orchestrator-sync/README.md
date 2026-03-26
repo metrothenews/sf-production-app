@@ -31,6 +31,12 @@ Render mode fields are read from config row (compiler input):
 - `Performance Clip A File ID` ... `Performance Clip F File ID` (optional explicit mapping for `preset`)
 - `Performance Preset` (fallback preset DSL for `preset` mode)
 - `Performance Source Folder ID` (optional; default: `YOUR_GOOGLE_SHEET_ID`)
+- `Output Parent Folder ID` (or `Video Output Folder ID` / `Video Output Folder`) for Drive upload destination
+
+Output routing behavior:
+- Pipeline output is uploaded under `Output Parent Folder ID`.
+- A campaign subfolder is auto-created from `Naming Convention` (default `PIPELINE_OUTPUT_SUBFOLDER_MODE=campaign`).
+- Final cut filenames still use `Naming Convention` numbering.
 
 Compiler fallback behavior for performance mode:
 - If `Performance Mode` is blank and any performance preset DSL exists (config fallback or Executive Preset column B), compiler auto-infers `preset`.

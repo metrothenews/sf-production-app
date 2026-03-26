@@ -88,6 +88,12 @@ def test_resolve_output_parent_folder_id_accepts_folder_url() -> None:
     assert out == "YOUR_GOOGLE_SHEET_ID"
 
 
+def test_resolve_output_parent_folder_id_accepts_video_output_folder_alias() -> None:
+    cfg = {"Video Output Folder": "https://drive.google.com/drive/folders/YOUR_GOOGLE_SHEET_ID"}
+    out = compiler._resolve_output_parent_folder_id(cfg)
+    assert out == "YOUR_GOOGLE_SHEET_ID"
+
+
 def test_resolve_output_parent_folder_id_cfg_wins_over_env(monkeypatch) -> None:
     monkeypatch.setenv("OUTPUT_PARENT_FOLDER_ID", "YOUR_GOOGLE_SHEET_ID")
     cfg = {"Output Parent Folder ID": "YOUR_GOOGLE_SHEET_ID"}
@@ -99,6 +105,14 @@ def test_resolve_output_parent_folder_id_uses_env_when_cfg_missing(monkeypatch) 
     monkeypatch.setenv("OUTPUT_PARENT_FOLDER_ID", "YOUR_GOOGLE_SHEET_ID")
     out = compiler._resolve_output_parent_folder_id({})
     assert out == "YOUR_GOOGLE_SHEET_ID"
+
+
+def test_resolve_output_parent_folder_reports_source(monkeypatch) -> None:
+    monkeypatch.delenv("OUTPUT_PARENT_FOLDER_ID", raising=False)
+    folder_id, source, raw = compiler._resolve_output_parent_folder({})
+    assert folder_id == compiler.OUTPUT_PARENT_FOLDER_ID_DEFAULT
+    assert source == "default"
+    assert raw == compiler.OUTPUT_PARENT_FOLDER_ID_DEFAULT
 
 
 def test_resolve_performance_ref_by_exact_name(monkeypatch) -> None:

@@ -85,6 +85,20 @@ TEXT_PRESET_FIELD_NAMES = [
     "text preset",
     "lyric preset",
 ]
+OUTPUT_PARENT_FOLDER_FIELD_NAMES = [
+    "Output Parent Folder ID",
+    "output_parent_folder_id",
+    "Output Drive Folder ID",
+    "output_drive_folder_id",
+    "Output Folder ID",
+    "output_folder_id",
+    "Output Folder",
+    "output_folder",
+    "Video Output Folder ID",
+    "video_output_folder_id",
+    "Video Output Folder",
+    "video_output_folder",
+]
 EDIT_MODE_FF_ONLY = "FF_ONLY"
 EDIT_MODE_FF_PLUS_PERF = "FF_PLUS_PERF"
 FOUND_FOOTAGE_MODE_TAB_DEFAULT = "found-footage-mode"
@@ -409,22 +423,21 @@ def _resolve_performance_source_folder_id(cfg: Mapping[str, Any]) -> str:
 
 
 def _resolve_output_parent_folder_id(cfg: Mapping[str, Any]) -> str:
+    folder_id, _, _ = _resolve_output_parent_folder(cfg)
+    return folder_id
+
+
+def _resolve_output_parent_folder(cfg: Mapping[str, Any]) -> tuple[str, str, str]:
     env_val = str(os.environ.get("OUTPUT_PARENT_FOLDER_ID", "") or "").strip()
     cfg_val = str(
         _cfg_value_by_names(
             cfg,
-            [
-                "Output Parent Folder ID",
-                "output_parent_folder_id",
-                "Output Drive Folder ID",
-                "output_drive_folder_id",
-                "Output Folder ID",
-                "output_folder_id",
-            ],
+            OUTPUT_PARENT_FOLDER_FIELD_NAMES,
             default="",
         )
         or ""
     ).strip()
+    source = "config" if cfg_val else ("env" if env_val else "default")
     chosen = cfg_val or env_val or OUTPUT_PARENT_FOLDER_ID_DEFAULT
     folder_id = _extract_drive_file_id(chosen)
     if not folder_id:
@@ -432,9 +445,9 @@ def _resolve_output_parent_folder_id(cfg: Mapping[str, Any]) -> str:
         if m:
             folder_id = str(m.group(1) or "")
     if folder_id:
-        return folder_id
+        return folder_id, source, chosen
     if DRIVE_ID_RE.match(chosen):
-        return chosen
+        return chosen, source, chosen
     raise RuntimeError(
         f"Invalid output parent folder value {chosen!r}; expected Drive folder id or URL."
     )
@@ -1472,11 +1485,15 @@ def main() -> int:
     ensure_drive_upload_credentials()
 
     cfg = _read_config_row(gw, config_sheet_id, config_tab, config_range)
-    output_parent_folder_id = _resolve_output_parent_folder_id(cfg)
+    output_parent_folder_id, output_parent_source, _ = _resolve_output_parent_folder(cfg)
     assets_folder_id = os.environ.get("ASSETS_FOLDER_ID", "").strip() or output_parent_folder_id
     mode_value = str(cfg.get("Mode") or "").strip()
     source_tab = str(cfg.get("_mode_source_tab") or config_tab).strip() or config_tab
     print(f"config_mode={mode_value or '(unset)'} config_source_tab={source_tab}")
+    print(
+        f"output_parent_folder_id={output_parent_folder_id} "
+        f"output_parent_source={output_parent_source}"
+    )
     print("preflight_asset_ids:")
     preflight_fields = [
         ("Audio File", "Audio File ID", False),
