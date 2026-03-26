@@ -408,6 +408,38 @@ def _resolve_performance_source_folder_id(cfg: Mapping[str, Any]) -> str:
     )
 
 
+def _resolve_output_parent_folder_id(cfg: Mapping[str, Any]) -> str:
+    env_val = str(os.environ.get("OUTPUT_PARENT_FOLDER_ID", "") or "").strip()
+    cfg_val = str(
+        _cfg_value_by_names(
+            cfg,
+            [
+                "Output Parent Folder ID",
+                "output_parent_folder_id",
+                "Output Drive Folder ID",
+                "output_drive_folder_id",
+                "Output Folder ID",
+                "output_folder_id",
+            ],
+            default="",
+        )
+        or ""
+    ).strip()
+    chosen = cfg_val or env_val or OUTPUT_PARENT_FOLDER_ID_DEFAULT
+    folder_id = _extract_drive_file_id(chosen)
+    if not folder_id:
+        m = re.search(r"/folders/([A-Za-z0-9_-]{20,})", str(chosen))
+        if m:
+            folder_id = str(m.group(1) or "")
+    if folder_id:
+        return folder_id
+    if DRIVE_ID_RE.match(chosen):
+        return chosen
+    raise RuntimeError(
+        f"Invalid output parent folder value {chosen!r}; expected Drive folder id or URL."
+    )
+
+
 def _list_folder_files_cached(
     *,
     drive_client: Any,
@@ -1434,14 +1466,14 @@ def main() -> int:
     config_tab = os.environ.get("CONFIG_TAB", CONFIG_TAB_DEFAULT).strip()
     config_range = os.environ.get("CONFIG_RANGE", CONFIG_RANGE_DEFAULT).strip()
     clips_library_folder_id = os.environ.get("CLIPS_LIBRARY_FOLDER_ID", CLIPS_LIBRARY_FOLDER_ID_DEFAULT).strip()
-    output_parent_folder_id = os.environ.get("OUTPUT_PARENT_FOLDER_ID", OUTPUT_PARENT_FOLDER_ID_DEFAULT).strip()
-    assets_folder_id = os.environ.get("ASSETS_FOLDER_ID", "").strip() or output_parent_folder_id
     drive_proxy_base = os.environ.get("DRIVE_PROXY_BASE_URL", "").strip()
     print(f"drive_proxy_base_url={drive_proxy_base or '(unset)'}")
 
     ensure_drive_upload_credentials()
 
     cfg = _read_config_row(gw, config_sheet_id, config_tab, config_range)
+    output_parent_folder_id = _resolve_output_parent_folder_id(cfg)
+    assets_folder_id = os.environ.get("ASSETS_FOLDER_ID", "").strip() or output_parent_folder_id
     mode_value = str(cfg.get("Mode") or "").strip()
     source_tab = str(cfg.get("_mode_source_tab") or config_tab).strip() or config_tab
     print(f"config_mode={mode_value or '(unset)'} config_source_tab={source_tab}")

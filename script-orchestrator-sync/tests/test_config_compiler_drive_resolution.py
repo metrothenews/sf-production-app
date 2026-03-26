@@ -76,6 +76,31 @@ def test_resolve_performance_source_folder_id_accepts_legacy_clips_folder_column
     assert out == "YOUR_GOOGLE_SHEET_ID"
 
 
+def test_resolve_output_parent_folder_id_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("OUTPUT_PARENT_FOLDER_ID", raising=False)
+    out = compiler._resolve_output_parent_folder_id({})
+    assert out == compiler.OUTPUT_PARENT_FOLDER_ID_DEFAULT
+
+
+def test_resolve_output_parent_folder_id_accepts_folder_url() -> None:
+    cfg = {"Output Parent Folder ID": "https://drive.google.com/drive/folders/YOUR_GOOGLE_SHEET_ID"}
+    out = compiler._resolve_output_parent_folder_id(cfg)
+    assert out == "YOUR_GOOGLE_SHEET_ID"
+
+
+def test_resolve_output_parent_folder_id_cfg_wins_over_env(monkeypatch) -> None:
+    monkeypatch.setenv("OUTPUT_PARENT_FOLDER_ID", "YOUR_GOOGLE_SHEET_ID")
+    cfg = {"Output Parent Folder ID": "YOUR_GOOGLE_SHEET_ID"}
+    out = compiler._resolve_output_parent_folder_id(cfg)
+    assert out == "YOUR_GOOGLE_SHEET_ID"
+
+
+def test_resolve_output_parent_folder_id_uses_env_when_cfg_missing(monkeypatch) -> None:
+    monkeypatch.setenv("OUTPUT_PARENT_FOLDER_ID", "YOUR_GOOGLE_SHEET_ID")
+    out = compiler._resolve_output_parent_folder_id({})
+    assert out == "YOUR_GOOGLE_SHEET_ID"
+
+
 def test_resolve_performance_ref_by_exact_name(monkeypatch) -> None:
     monkeypatch.setenv("PERFORMANCE_CLIP_NAME_RESOLUTION", "1")
     drive_client = _FakeDriveClient(
