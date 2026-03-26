@@ -167,6 +167,9 @@ def build_batch_create_request(
     text_preset_override = str(os.environ.get("TEXT_PRESET_OVERRIDE", "")).strip()
     if text_preset_override:
         env_vars["TEXT_PRESET_OVERRIDE"] = text_preset_override
+    output_parent_folder_id = str(os.environ.get("OUTPUT_PARENT_FOLDER_ID", "")).strip()
+    if output_parent_folder_id:
+        env_vars["OUTPUT_PARENT_FOLDER_ID"] = output_parent_folder_id
     key_file = str(cfg.drive_sa_key_file or "").strip()
     if key_file:
         env_vars["DRIVE_SA_KEY_FILE"] = key_file
