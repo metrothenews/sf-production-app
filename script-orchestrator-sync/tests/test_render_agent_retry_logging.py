@@ -163,6 +163,33 @@ def test_pick_cut_source_video_falls_back_to_base_when_candidate_short(monkeypat
     assert out == "/tmp/base.mp4"
 
 
+def test_pick_cut_source_video_keeps_candidate_when_base_fallback_disabled(monkeypatch) -> None:
+    durations = {"/tmp/base.mp4": 15.0, "/tmp/lyrics.mp4": 2.0}
+    monkeypatch.setattr(render_agent, "_probe_media_duration_seconds", lambda path: durations[path])
+    out = render_agent._pick_cut_source_video(
+        base_mp4="/tmp/base.mp4",
+        candidate_mp4="/tmp/lyrics.mp4",
+        max_cut_end_s=10.0,
+        candidate_label="lyrics",
+        candidate_log_path="/tmp/lyrics.log",
+        allow_base_fallback=False,
+    )
+    assert out == "/tmp/lyrics.mp4"
+
+
+def test_pick_cut_source_video_uses_gate_aligned_tolerance(monkeypatch) -> None:
+    durations = {"/tmp/base.mp4": 15.0, "/tmp/lyrics.mp4": 9.85}
+    monkeypatch.setattr(render_agent, "_probe_media_duration_seconds", lambda path: durations[path])
+    out = render_agent._pick_cut_source_video(
+        base_mp4="/tmp/base.mp4",
+        candidate_mp4="/tmp/lyrics.mp4",
+        max_cut_end_s=10.0,
+        candidate_label="lyrics",
+        candidate_log_path="/tmp/lyrics.log",
+    )
+    assert out == "/tmp/lyrics.mp4"
+
+
 def test_pick_cut_source_video_raises_when_both_short(monkeypatch) -> None:
     durations = {"/tmp/base.mp4": 4.0, "/tmp/lyrics.mp4": 2.0}
     monkeypatch.setattr(render_agent, "_probe_media_duration_seconds", lambda path: durations[path])
@@ -175,3 +202,20 @@ def test_pick_cut_source_video_raises_when_both_short(monkeypatch) -> None:
             candidate_log_path="/tmp/lyrics.log",
         )
 
+
+def test_expected_frames_for_selected_source_prefers_probed_frames(monkeypatch) -> None:
+    monkeypatch.setattr(render_agent, "_probe_media_video_frame_count", lambda _path: 801)
+    out = render_agent._expected_frames_for_selected_source(
+        selected_source="/tmp/lyrics.mp4",
+        default_expected_frames=804,
+    )
+    assert out == 801
+
+
+def test_expected_frames_for_selected_source_uses_default_when_probe_missing(monkeypatch) -> None:
+    monkeypatch.setattr(render_agent, "_probe_media_video_frame_count", lambda _path: 0)
+    out = render_agent._expected_frames_for_selected_source(
+        selected_source="/tmp/lyrics.mp4",
+        default_expected_frames=804,
+    )
+    assert out == 804

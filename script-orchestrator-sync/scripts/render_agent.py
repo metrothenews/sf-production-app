@@ -917,6 +917,52 @@ def _allow_empty_lyrics_srt() -> bool:
     return os.environ.get("ALLOW_EMPTY_LYRICS_SRT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _strict_lyrics_overlay_enabled() -> bool:
+    return os.environ.get("PIPELINE_STRICT_LYRICS_OVERLAY", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _handle_lyrics_stage_fallback(
+    *,
+    stage: str,
+    cut_idx: int,
+    filename: str,
+    reason: str,
+    lyrics_cues: int,
+    source_path: str,
+    output_path: str,
+    log_path: str,
+    strict_on_nonempty: bool,
+) -> None:
+    has_cues = int(lyrics_cues) > 0
+    strict_mode = _strict_lyrics_overlay_enabled()
+    fail = bool(strict_on_nonempty and has_cues and strict_mode)
+    _emit_event(
+        event="stage_fallback",
+        stage=stage,
+        cut_idx=cut_idx,
+        severity="error" if fail else "warning",
+        code="E_LYRICS_STAGE_FALLBACK" if fail else "W_LYRICS_STAGE_FALLBACK",
+        message="lyrics output fallback applied",
+        filename=filename,
+        fallback_reason=reason,
+        lyrics_cues=int(lyrics_cues),
+        strict_lyrics_overlay=bool(strict_mode),
+        source_path=str(source_path),
+        output_path=str(output_path),
+        log_path=str(log_path),
+    )
+    if fail:
+        raise RuntimeError(
+            "lyrics overlay output fallback was used for non-empty lyric cues "
+            f"(filename={filename} reason={reason} cues={int(lyrics_cues)})."
+        )
+
+
 def _pipeline_per_cut_render_enabled() -> bool:
     return os.environ.get("PIPELINE_PER_CUT_RENDER", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -1394,12 +1440,17 @@ def _pick_cut_source_video(
     max_cut_end_s: float,
     candidate_label: str,
     candidate_log_path: str,
-    tolerance_s: float = 0.05,
+    allow_base_fallback: bool = True,
+    # Keep this aligned with output gate tolerance so we do not silently drop
+    # overlay outputs that are only a few frames shorter.
+    tolerance_s: float = 0.20,
 ) -> str:
     if max_cut_end_s <= 0:
         return candidate_mp4
     candidate_duration = _probe_media_duration_seconds(candidate_mp4)
     if candidate_duration + tolerance_s >= max_cut_end_s:
+        return candidate_mp4
+    if not allow_base_fallback:
         return candidate_mp4
     base_duration = _probe_media_duration_seconds(base_mp4)
     if base_duration + tolerance_s >= max_cut_end_s:
@@ -1410,6 +1461,13 @@ def _pick_cut_source_video(
         f"candidate_duration_s={candidate_duration:.3f} base_duration_s={base_duration:.3f} "
         f"candidate={candidate_mp4} base={base_mp4} candidate_log={candidate_log_path})."
     )
+
+
+def _expected_frames_for_selected_source(*, selected_source: str, default_expected_frames: int) -> int:
+    probed_frames = _probe_media_video_frame_count(selected_source)
+    if probed_frames > 0:
+        return int(probed_frames)
+    return max(1, int(default_expected_frames))
 
 
 def build_pipeline_subfolder_name(campaign_id: str, run_id: str) -> str:
@@ -2803,6 +2861,7 @@ def run_once() -> int:
                         raise RuntimeError("performance preset mode requires between 2 and 6 labeled clips (a-f).")
 
                 cut_logs: list[str] = []
+                cut_lyrics_logs: list[str] = []
                 local_shorts: list[str] = []
                 artifacts_written = 0
                 if not normalized_cuts:
@@ -2946,6 +3005,7 @@ def run_once() -> int:
                         )
                     selected_source = cut_base_mp4
                     selected_log = cut_lyrics_log
+                    lyrics_stage = f"performance_lyrics:{filename}"
                     if lyrics_cues > 0:
                         lyrics_job = {
                             "input_video_path": cut_base_mp4,
@@ -2963,41 +3023,77 @@ def run_once() -> int:
                         _run_to_log(
                             build_vse_text_command(lyrics_job, blender_bin=blender_bin, script_path=VSE_TEXT_SCRIPT_PATH),
                             cut_lyrics_log,
-                            stage=f"performance_lyrics:{filename}",
+                            stage=lyrics_stage,
                             cut_idx=i,
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
                         )
-                        _materialize_video_fallback_output(
+                        lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
                             source_path=cut_base_mp4,
                             log_path=cut_lyrics_log,
                             note="lyrics_fallback=copy_base reason=missing_or_empty_lyrics_output",
                         )
+                        if lyrics_fallback_applied:
+                            _handle_lyrics_stage_fallback(
+                                stage=lyrics_stage,
+                                cut_idx=i,
+                                filename=filename,
+                                reason="missing_or_empty_lyrics_output",
+                                lyrics_cues=lyrics_cues,
+                                source_path=cut_base_mp4,
+                                output_path=cut_lyrics_mp4,
+                                log_path=cut_lyrics_log,
+                                strict_on_nonempty=True,
+                            )
                         selected_source = cut_lyrics_mp4
                     else:
-                        _materialize_video_fallback_output(
+                        lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
                             source_path=cut_base_mp4,
                             log_path=cut_lyrics_log,
                             note="lyrics_fallback=copy_base reason=empty_lyrics_srt",
                         )
+                        if lyrics_fallback_applied:
+                            _handle_lyrics_stage_fallback(
+                                stage=lyrics_stage,
+                                cut_idx=i,
+                                filename=filename,
+                                reason="empty_lyrics_srt",
+                                lyrics_cues=lyrics_cues,
+                                source_path=cut_base_mp4,
+                                output_path=cut_lyrics_mp4,
+                                log_path=cut_lyrics_log,
+                                strict_on_nonempty=False,
+                            )
                         selected_source = cut_lyrics_mp4
                     try:
-                        _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
+                        _emit_media_summary_event(path=selected_source, stage=lyrics_stage, cut_idx=i)
                     except RuntimeError as exc:
                         msg = str(exc)
                         if "ffprobe failed for" not in msg:
                             raise
-                        _materialize_video_fallback_output(
+                        lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
                             source_path=cut_base_mp4,
                             log_path=cut_lyrics_log,
                             note="lyrics_fallback=copy_base reason=ffprobe_probe_failed",
                         )
+                        if lyrics_fallback_applied:
+                            _handle_lyrics_stage_fallback(
+                                stage=lyrics_stage,
+                                cut_idx=i,
+                                filename=filename,
+                                reason="ffprobe_probe_failed",
+                                lyrics_cues=lyrics_cues,
+                                source_path=cut_base_mp4,
+                                output_path=cut_lyrics_mp4,
+                                log_path=cut_lyrics_log,
+                                strict_on_nonempty=True,
+                            )
                         selected_source = cut_lyrics_mp4
-                        _emit_media_summary_event(path=selected_source, stage=f"performance_lyrics:{filename}", cut_idx=i)
+                        _emit_media_summary_event(path=selected_source, stage=lyrics_stage, cut_idx=i)
 
                     has_copy = "copy" in stage_plan and str(resolved.get("copy_srt_path") or "").strip()
                     if has_copy:
@@ -3029,12 +3125,26 @@ def run_once() -> int:
                                 retry_delay_seconds=blender_retry_delay_s,
                                 output_probe_path=cut_final_mp4,
                             )
-                            _materialize_video_fallback_output(
+                            copy_fallback_applied = _materialize_video_fallback_output(
                                 output_path=cut_final_mp4,
                                 source_path=selected_source,
                                 log_path=cut_copy_log,
                                 note="copy_fallback=use_lyrics reason=missing_or_empty_copy_output",
                             )
+                            if copy_fallback_applied:
+                                _emit_event(
+                                    event="stage_fallback",
+                                    stage=f"performance_copy:{filename}",
+                                    cut_idx=i,
+                                    severity="warning",
+                                    code="W_COPY_STAGE_FALLBACK",
+                                    message="copy output fallback applied",
+                                    filename=filename,
+                                    fallback_reason="missing_or_empty_copy_output",
+                                    source_path=str(selected_source),
+                                    output_path=str(cut_final_mp4),
+                                    log_path=str(cut_copy_log),
+                                )
                             selected_source = cut_final_mp4
                             selected_log = cut_copy_log
 
@@ -3045,6 +3155,7 @@ def run_once() -> int:
                         max_cut_end_s=cut_duration,
                         candidate_label=source_label,
                         candidate_log_path=selected_log,
+                        allow_base_fallback=(source_label == "copy"),
                     )
                     if selected_for_duration != selected_source:
                         with Path(selected_log).open("a", encoding="utf-8") as lf:
@@ -3055,11 +3166,13 @@ def run_once() -> int:
                             )
                         selected_source = selected_for_duration
 
-                    if selected_source == cut_base_mp4:
-                        # Master-cut outputs can keep source cadence (for example 24fps) while
-                        # job/display fps is 30. When we intentionally fall back to base, gate
-                        # against actual base frames to avoid false short-frame failures.
-                        cut_expected_frames = max(1, _probe_media_video_frame_count(cut_base_mp4))
+                    # Gate frames against the exact media we normalize from. Overlay and preset
+                    # stages can land a few frames shorter than duration*fps while still passing
+                    # duration tolerance, so probing the selected source avoids false failures.
+                    cut_expected_frames = _expected_frames_for_selected_source(
+                        selected_source=selected_source,
+                        default_expected_frames=cut_expected_frames,
+                    )
 
                     _run_to_log(
                         build_ffmpeg_instagram_normalize_command(
@@ -3088,6 +3201,7 @@ def run_once() -> int:
                     )
                     _emit_media_summary_event(path=out_short, stage=f"performance_short:{filename}", cut_idx=i)
                     cut_logs.append(selected_log)
+                    cut_lyrics_logs.append(cut_lyrics_log)
                     _EVENT_SUMMARY["cuts_attempted"] = int(_EVENT_SUMMARY.get("cuts_attempted", 0)) + 1
                     _EVENT_SUMMARY["cuts_succeeded"] = int(_EVENT_SUMMARY.get("cuts_succeeded", 0)) + 1
 
@@ -3172,6 +3286,17 @@ def run_once() -> int:
                                 created_utc=created,
                             )
                         )
+                    for i, log_path in enumerate(cut_lyrics_logs, start=1):
+                        artifact_rows.append(
+                            _build_output_row_from_file(
+                                run_id=run_id,
+                                render_job_id=render_job_id,
+                                campaign_id=str(job.get("campaign_id") or ""),
+                                artifact_type=f"pipeline_lyrics_cut_log_{i:02d}",
+                                file_path=log_path,
+                                created_utc=created,
+                            )
+                        )
                 events_path = _event_log_path()
                 if events_path and Path(events_path).exists():
                     events_row = _build_output_row_from_file(
@@ -3194,6 +3319,51 @@ def run_once() -> int:
                         artifacts_written += 1
                     else:
                         artifact_rows.append(events_row)
+                if is_drive_output and client is not None:
+                    for i, log_path in enumerate(cut_lyrics_logs, start=1):
+                        log_file = Path(log_path)
+                        if not log_file.exists():
+                            continue
+                        lyrics_log_row = _build_output_row_from_file(
+                            run_id=run_id,
+                            render_job_id=render_job_id,
+                            campaign_id=str(job.get("campaign_id") or ""),
+                            artifact_type=f"pipeline_lyrics_cut_log_{i:02d}",
+                            file_path=str(log_file),
+                            created_utc=created,
+                        )
+                        log_artifact_type = str(lyrics_log_row.get("artifact_type") or "")
+                        log_filename = str(lyrics_log_row.get("filename") or "")
+                        if should_upload_artifact(
+                            existing_rows,
+                            run_id=run_id,
+                            artifact_type=log_artifact_type,
+                            filename=log_filename,
+                        ):
+                            lyrics_log_row = _upload_confirm_record_and_delete(
+                                gw=gw,
+                                control_sheet_id=control_sheet_id,
+                                client=client,
+                                artifact_row=lyrics_log_row,
+                                drive_folder_id=drive_folder_id,
+                                verify_mode=verify_mode,
+                            )
+                        else:
+                            existing = _find_existing_uploaded_artifact(
+                                existing_rows,
+                                run_id=run_id,
+                                artifact_type=log_artifact_type,
+                                filename=log_filename,
+                            )
+                            if existing:
+                                lyrics_log_row["drive_file_id"] = str(existing.get("drive_file_id") or "")
+                                lyrics_log_row["drive_folder_id"] = str(
+                                    existing.get("drive_folder_id") or drive_folder_id
+                                )
+                            append_outputs_index_rows(gw, control_sheet_id, [lyrics_log_row])
+                            _delete_local_file_best_effort(str(log_file))
+                        artifacts_written += 1
+                        existing_rows.append(lyrics_log_row)
                 if artifact_rows:
                     artifacts_written += append_outputs_index_rows(gw, control_sheet_id, artifact_rows)
                 pipeline_run_succeeded = True
@@ -3353,6 +3523,7 @@ def run_once() -> int:
                     max_cut_end_s=max_cut_end_s,
                     candidate_label=source_label,
                     candidate_log_path=source_log,
+                    allow_base_fallback=(source_label == "copy"),
                 )
                 if selected_source != final_mp4_local:
                     with Path(source_log).open("a", encoding="utf-8") as lf:
@@ -3662,6 +3833,7 @@ def run_once() -> int:
                     }
                     if shared_auto_baseline_wps > 0.0:
                         lyrics_job["auto_baseline_wps"] = shared_auto_baseline_wps
+                    lyrics_stage = f"lyrics:{filename}"
                     if has_lyrics_for_cut or song_title_overlay["enabled"]:
                         lyrics_cmd = build_vse_text_command(
                             lyrics_job,
@@ -3674,18 +3846,30 @@ def run_once() -> int:
                         _run_to_log(
                             lyrics_cmd,
                             cut_lyrics_log,
-                            stage=f"lyrics:{filename}",
+                            stage=lyrics_stage,
                             cut_idx=i,
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
                         )
-                        _materialize_video_fallback_output(
+                        lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
                             source_path=source_for_lyrics,
                             log_path=cut_lyrics_log,
                             note="lyrics_fallback=copy_source reason=missing_or_empty_lyrics_output",
                         )
+                        if lyrics_fallback_applied:
+                            _handle_lyrics_stage_fallback(
+                                stage=lyrics_stage,
+                                cut_idx=i,
+                                filename=filename,
+                                reason="missing_or_empty_lyrics_output",
+                                lyrics_cues=cut_lyrics_cues,
+                                source_path=source_for_lyrics,
+                                output_path=cut_lyrics_mp4,
+                                log_path=cut_lyrics_log,
+                                strict_on_nonempty=has_lyrics_for_cut,
+                            )
                         if shared_auto_baseline_wps <= 0.0:
                             shared_auto_baseline_wps = _extract_reveal_auto_speed_baseline_from_log(cut_lyrics_log)
                             if shared_auto_baseline_wps > 0.0:
@@ -3694,26 +3878,50 @@ def run_once() -> int:
                                     f"cut_idx={i} filename={filename} baseline_wps={shared_auto_baseline_wps:.3f}"
                                 )
                         try:
-                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
+                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=lyrics_stage, cut_idx=i)
                         except RuntimeError as exc:
                             msg = str(exc)
                             if "ffprobe failed for" not in msg:
                                 raise
-                            _materialize_video_fallback_output(
+                            lyrics_fallback_applied = _materialize_video_fallback_output(
                                 output_path=cut_lyrics_mp4,
                                 source_path=source_for_lyrics,
                                 log_path=cut_lyrics_log,
                                 note="lyrics_fallback=copy_source reason=ffprobe_probe_failed",
                             )
-                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
+                            if lyrics_fallback_applied:
+                                _handle_lyrics_stage_fallback(
+                                    stage=lyrics_stage,
+                                    cut_idx=i,
+                                    filename=filename,
+                                    reason="ffprobe_probe_failed",
+                                    lyrics_cues=cut_lyrics_cues,
+                                    source_path=source_for_lyrics,
+                                    output_path=cut_lyrics_mp4,
+                                    log_path=cut_lyrics_log,
+                                    strict_on_nonempty=has_lyrics_for_cut,
+                                )
+                            _emit_media_summary_event(path=cut_lyrics_mp4, stage=lyrics_stage, cut_idx=i)
                     else:
-                        _materialize_video_fallback_output(
+                        lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
                             source_path=source_for_lyrics,
                             log_path=cut_lyrics_log,
                             note="lyrics_fallback=copy_source reason=empty_lyrics_srt",
                         )
-                        _emit_media_summary_event(path=cut_lyrics_mp4, stage=f"lyrics:{filename}", cut_idx=i)
+                        if lyrics_fallback_applied:
+                            _handle_lyrics_stage_fallback(
+                                stage=lyrics_stage,
+                                cut_idx=i,
+                                filename=filename,
+                                reason="empty_lyrics_srt",
+                                lyrics_cues=cut_lyrics_cues,
+                                source_path=source_for_lyrics,
+                                output_path=cut_lyrics_mp4,
+                                log_path=cut_lyrics_log,
+                                strict_on_nonempty=False,
+                            )
+                        _emit_media_summary_event(path=cut_lyrics_mp4, stage=lyrics_stage, cut_idx=i)
 
                     selected_cut_source = cut_lyrics_mp4
                     selected_copy_log = ""
@@ -3746,12 +3954,26 @@ def run_once() -> int:
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_final_stage_mp4,
                         )
-                        _materialize_video_fallback_output(
+                        copy_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_final_stage_mp4,
                             source_path=cut_lyrics_mp4,
                             log_path=cut_copy_log,
                             note="copy_fallback=use_lyrics reason=missing_or_empty_copy_output",
                         )
+                        if copy_fallback_applied:
+                            _emit_event(
+                                event="stage_fallback",
+                                stage=f"copy:{filename}",
+                                cut_idx=i,
+                                severity="warning",
+                                code="W_COPY_STAGE_FALLBACK",
+                                message="copy output fallback applied",
+                                filename=filename,
+                                fallback_reason="missing_or_empty_copy_output",
+                                source_path=str(cut_lyrics_mp4),
+                                output_path=str(cut_final_stage_mp4),
+                                log_path=str(cut_copy_log),
+                            )
                         _emit_media_summary_event(path=cut_final_stage_mp4, stage=f"copy:{filename}", cut_idx=i)
                         selected_cut_source = cut_final_stage_mp4
                         selected_copy_log = cut_copy_log

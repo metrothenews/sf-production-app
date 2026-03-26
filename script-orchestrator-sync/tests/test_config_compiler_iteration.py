@@ -41,6 +41,18 @@ def test_resolve_text_preset_override_from_env(monkeypatch) -> None:
     assert source == "env:TEXT_PRESET_OVERRIDE"
 
 
+def test_resolve_text_preset_selector_registry_aliases() -> None:
+    assert compiler._resolve_text_preset_selector("Preset 1") == "brat_words_manual_lightgrey_narrow_pixelate_v007"
+    assert compiler._resolve_text_preset_selector("preset2") == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert compiler._resolve_text_preset_selector("option 2") == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert compiler._resolve_text_preset_selector("2") == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+
+
+def test_resolve_text_preset_selector_rejects_unknown_registry_key() -> None:
+    with pytest.raises(RuntimeError, match=r"Unknown text preset registry selector"):
+        compiler._resolve_text_preset_selector("Preset 9")
+
+
 def test_resolve_text_preset_override_from_config() -> None:
     value, source = compiler._resolve_text_preset_override_from_cfg(
         {
@@ -49,6 +61,13 @@ def test_resolve_text_preset_override_from_config() -> None:
     )
     assert value == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
     assert source == "config:lyric_text_preset_override"
+
+
+def test_resolve_text_preset_override_prefers_config_registry_value(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT_PRESET_OVERRIDE", "text_preset_brat_words_manual_lightgrey_narrow_pixelate_v007.py")
+    value, source = compiler._resolve_text_preset_override_from_cfg({"Text Preset Option": "Preset 2"})
+    assert value == "brat_words_manual_lightgrey_narrow_pixelate_v007_option2"
+    assert source == "config:text_preset_registry"
 
 
 def test_apply_text_preset_override_updates_preset_and_rows(capsys) -> None:
@@ -316,6 +335,36 @@ def test_read_preset_rows_from_sheet1_layout() -> None:
         {
             "stitch_preset": "2p2u2c2t2m2f",
             "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007",
+            "performance_preset": "4a2br2cw",
+        },
+    ]
+
+
+def test_read_preset_rows_resolves_registry_labels_and_carries_forward() -> None:
+    class _FakeGateway:
+        def read(self, _sheet_id: str, _ranges: list[str]):
+            return {
+                "valueRanges": [
+                    {
+                        "values": [
+                            ["FF Presets", "Performance Presets", "Lyric Presets"],
+                            ["1p1u1f1c1m1t", "4a2br2cw", "Preset 2"],
+                            ["2p2u2c2t2m2f", "", ""],
+                        ]
+                    }
+                ]
+            }
+
+    rows = compiler._read_preset_rows(_FakeGateway(), "sheet_id", tab="Sheet1")
+    assert rows == [
+        {
+            "stitch_preset": "1p1u1f1c1m1t",
+            "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007_option2",
+            "performance_preset": "4a2br2cw",
+        },
+        {
+            "stitch_preset": "2p2u2c2t2m2f",
+            "text_preset": "brat_words_manual_lightgrey_narrow_pixelate_v007_option2",
             "performance_preset": "4a2br2cw",
         },
     ]

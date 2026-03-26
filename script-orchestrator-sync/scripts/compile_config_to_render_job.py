@@ -75,6 +75,16 @@ PERFORMANCE_PRESET_FIELD_NAMES = [
     "performance_presets",
 ]
 TEXT_PRESET_FIELD_NAMES = [
+    "Text Preset Option",
+    "Lyric Preset Option",
+    "Text Preset Slot",
+    "Lyric Preset Slot",
+    "Text Preset Registry",
+    "Lyric Preset Registry",
+    "Text Preset Label",
+    "Lyric Preset Label",
+    "Text Preset Key",
+    "Lyric Preset Key",
     "Lyric Preset Override",
     "Text Preset Override",
     "Lyric Preset",
@@ -85,6 +95,10 @@ TEXT_PRESET_FIELD_NAMES = [
     "text preset",
     "lyric preset",
 ]
+TEXT_PRESET_REGISTRY: Mapping[int, str] = {
+    1: "brat_words_manual_lightgrey_narrow_pixelate_v007",
+    2: "brat_words_manual_lightgrey_narrow_pixelate_v007_option2",
+}
 OUTPUT_PARENT_FOLDER_FIELD_NAMES = [
     "Output Parent Folder ID",
     "output_parent_folder_id",
@@ -1222,15 +1236,92 @@ def _normalize_text_preset_name(raw: str) -> str:
     return text
 
 
+def _normalize_text_preset_registry_key(raw: str) -> str:
+    text = str(raw or "").strip().lower().replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _text_preset_registry_aliases() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for idx, preset_name in sorted(TEXT_PRESET_REGISTRY.items()):
+        canonical = _normalize_text_preset_name(preset_name)
+        if not canonical:
+            continue
+        for alias in (
+            canonical,
+            f"preset {idx}",
+            f"preset{idx}",
+            f"option {idx}",
+            f"option{idx}",
+            f"slot {idx}",
+            f"slot{idx}",
+            f"p{idx}",
+            str(idx),
+        ):
+            out[_normalize_text_preset_registry_key(alias)] = canonical
+    return out
+
+
+def _text_preset_registry_known_labels() -> str:
+    return ", ".join([f"Preset {k}" for k in sorted(TEXT_PRESET_REGISTRY.keys())])
+
+
+def _resolve_text_preset_selector(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    aliases = _text_preset_registry_aliases()
+    for candidate in (text, _normalize_text_preset_name(text)):
+        key = _normalize_text_preset_registry_key(candidate)
+        if key in aliases:
+            return aliases[key]
+        m = re.fullmatch(r"(?:preset|option|slot|p)?\s*([0-9]+)", key)
+        if m:
+            idx = int(m.group(1))
+            if idx not in TEXT_PRESET_REGISTRY:
+                known = _text_preset_registry_known_labels()
+                raise RuntimeError(
+                    f"Unknown text preset registry selector {text!r}; expected one of: {known}"
+                )
+    return _normalize_text_preset_name(text)
+
+
+def _resolve_text_preset_cfg_value(cfg: Mapping[str, Any]) -> tuple[str, str]:
+    for name in TEXT_PRESET_FIELD_NAMES:
+        if name in cfg:
+            value = str(cfg.get(name) or "").strip()
+            if value:
+                return value, str(name)
+    by_lower: dict[str, tuple[str, Any]] = {str(k).strip().lower(): (str(k), v) for k, v in cfg.items()}
+    for name in TEXT_PRESET_FIELD_NAMES:
+        hit = by_lower.get(str(name).strip().lower())
+        if not hit:
+            continue
+        hit_name, hit_value = hit
+        value = str(hit_value or "").strip()
+        if value:
+            return value, str(hit_name)
+    return "", ""
+
+
+def _text_preset_source_from_field(field_name: str) -> str:
+    normalized = _normalize_text_preset_registry_key(field_name)
+    if "override" in normalized:
+        return "config:lyric_text_preset_override"
+    if any(token in normalized for token in ("option", "slot", "registry", "label", "key")):
+        return "config:text_preset_registry"
+    return "config:text_preset_field"
+
+
 def _resolve_text_preset_override_from_cfg(cfg: Mapping[str, Any]) -> tuple[str, str]:
+    cfg_raw, cfg_field = _resolve_text_preset_cfg_value(cfg)
+    cfg_norm = _resolve_text_preset_selector(cfg_raw)
+    if cfg_norm:
+        return cfg_norm, _text_preset_source_from_field(cfg_field)
     env_raw = str(os.environ.get("TEXT_PRESET_OVERRIDE", "") or "").strip()
-    env_norm = _normalize_text_preset_name(env_raw)
+    env_norm = _resolve_text_preset_selector(env_raw)
     if env_norm:
         return env_norm, "env:TEXT_PRESET_OVERRIDE"
-    cfg_raw = str(_cfg_value_by_names(cfg, TEXT_PRESET_FIELD_NAMES, default="") or "").strip()
-    cfg_norm = _normalize_text_preset_name(cfg_raw)
-    if cfg_norm:
-        return cfg_norm, "config:lyric_text_preset_override"
     return "", ""
 
 
@@ -1373,7 +1464,7 @@ def _read_preset_rows(gateway: SheetsGateway, preset_sheet_id: str, tab: str = "
         ff = str(raw[0]).strip() if len(raw) > 0 else ""
         performance = str(raw[1]).strip() if len(raw) > 1 else ""
         lyric = str(raw[2]).strip() if len(raw) > 2 else ""
-        lyric_norm = _normalize_text_preset_name(lyric)
+        lyric_norm = _resolve_text_preset_selector(lyric)
         if lyric_norm:
             last_lyric = lyric_norm
         elif last_lyric:

@@ -5,6 +5,8 @@ import importlib.util
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "render_agent.py"
 _SPEC = importlib.util.spec_from_file_location("render_agent", _SCRIPT_PATH)
@@ -101,3 +103,58 @@ def test_build_outputs_rows_for_vse_text_contains_run_and_artifact_metadata() ->
         assert log_row["bytes"] == len(log_bytes)
         assert log_row["sha256"] == hashlib.sha256(log_bytes).hexdigest()
         assert log_path in str(log_row["notes"])
+
+
+def test_strict_lyrics_overlay_enabled_defaults_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PIPELINE_STRICT_LYRICS_OVERLAY", raising=False)
+    assert render_agent._strict_lyrics_overlay_enabled() is True
+
+
+def test_strict_lyrics_overlay_enabled_supports_disable_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PIPELINE_STRICT_LYRICS_OVERLAY", "0")
+    assert render_agent._strict_lyrics_overlay_enabled() is False
+    monkeypatch.setenv("PIPELINE_STRICT_LYRICS_OVERLAY", "off")
+    assert render_agent._strict_lyrics_overlay_enabled() is False
+
+
+def test_handle_lyrics_stage_fallback_raises_when_strict_and_nonempty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PIPELINE_STRICT_LYRICS_OVERLAY", "1")
+    with pytest.raises(RuntimeError, match="non-empty lyric cues"):
+        render_agent._handle_lyrics_stage_fallback(
+            stage="lyrics:test.mp4",
+            cut_idx=1,
+            filename="test.mp4",
+            reason="missing_or_empty_lyrics_output",
+            lyrics_cues=3,
+            source_path="/tmp/base.mp4",
+            output_path="/tmp/lyrics.mp4",
+            log_path="/tmp/lyrics.log",
+            strict_on_nonempty=True,
+        )
+
+
+def test_handle_lyrics_stage_fallback_no_raise_for_empty_or_non_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PIPELINE_STRICT_LYRICS_OVERLAY", "1")
+    render_agent._handle_lyrics_stage_fallback(
+        stage="lyrics:test.mp4",
+        cut_idx=1,
+        filename="test.mp4",
+        reason="empty_lyrics_srt",
+        lyrics_cues=0,
+        source_path="/tmp/base.mp4",
+        output_path="/tmp/lyrics.mp4",
+        log_path="/tmp/lyrics.log",
+        strict_on_nonempty=False,
+    )
+    monkeypatch.setenv("PIPELINE_STRICT_LYRICS_OVERLAY", "0")
+    render_agent._handle_lyrics_stage_fallback(
+        stage="lyrics:test.mp4",
+        cut_idx=1,
+        filename="test.mp4",
+        reason="missing_or_empty_lyrics_output",
+        lyrics_cues=5,
+        source_path="/tmp/base.mp4",
+        output_path="/tmp/lyrics.mp4",
+        log_path="/tmp/lyrics.log",
+        strict_on_nonempty=True,
+    )

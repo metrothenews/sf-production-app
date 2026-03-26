@@ -58,9 +58,16 @@ Executive preset sheet columns (`Executive Preset File ID`) are interpreted as:
 - Column C: text/lyrics preset (`Lyric Presets`)
 
 Text preset override options (single switch for all queued jobs/cuts):
-- Config row field `Lyric Preset Override` (or `Text Preset Override`)
-- Env var `TEXT_PRESET_OVERRIDE`
-- Accepted values: `text_preset_<name>.py` or `<name>` (both normalize to `<name>`)
+- Config row text preset selector fields (recommended):
+  - `Text Preset Option` / `Lyric Preset Option` (plus `Slot`, `Registry`, `Label`, `Key` aliases)
+  - Registry labels map to canonical preset names:
+    - `Preset 1` -> `brat_words_manual_lightgrey_narrow_pixelate_v007`
+    - `Preset 2` -> `brat_words_manual_lightgrey_narrow_pixelate_v007_option2`
+  - Accepted selector forms: `Preset 2`, `preset2`, `p2`, `2`, `option 2`, `slot 2`
+- Direct preset-name fields are also accepted: `Lyric Preset`, `Text Preset`
+- Legacy override fields remain supported: `Lyric Preset Override`, `Text Preset Override`
+- Env var `TEXT_PRESET_OVERRIDE` is fallback-only when config does not specify a text preset selector/name
+- Accepted direct values: `text_preset_<name>.py` or `<name>` (both normalize to `<name>`)
 
 Performance preset DSL grammar:
 - Repeated tokens: `<duration><clip><modifiers>`
@@ -985,7 +992,7 @@ CONTROL_SHEET_ID=YOUR_GOOGLE_SHEET_ID \
 GOOGLE_APPLICATION_CREDENTIALS=/Users/samrooker/.config/gcloud/application_default_credentials.json \
 make run-batch
 
-# Optional: force one lyric preset for all cuts in this run
+# Optional fallback (only when config row does not set a text preset selector/name)
 TEXT_PRESET_OVERRIDE=brat_words_manual_lightgrey_narrow_pixelate_v007_option2 \
 make run-batch
 ```
