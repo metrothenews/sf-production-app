@@ -170,6 +170,16 @@ def build_batch_create_request(
     output_parent_folder_id = str(os.environ.get("OUTPUT_PARENT_FOLDER_ID", "")).strip()
     if output_parent_folder_id:
         env_vars["OUTPUT_PARENT_FOLDER_ID"] = output_parent_folder_id
+    for key in (
+        "PIPELINE_LYRICS_STAGE_DIAG",
+        "PIPELINE_STRICT_LYRICS_OVERLAY",
+        "PIPELINE_FORENSICS_ON_FAILURE",
+        "PIPELINE_FORENSICS_UPLOAD",
+        "PIPELINE_UPLOAD_VERIFY_MODE",
+    ):
+        value = str(os.environ.get(key, "")).strip()
+        if value:
+            env_vars[key] = value
     key_file = str(cfg.drive_sa_key_file or "").strip()
     if key_file:
         env_vars["DRIVE_SA_KEY_FILE"] = key_file
