@@ -926,6 +926,93 @@ def _strict_lyrics_overlay_enabled() -> bool:
     }
 
 
+def _lyrics_stage_diag_enabled() -> bool:
+    return os.environ.get("PIPELINE_LYRICS_STAGE_DIAG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _probe_output_state(path: str) -> dict[str, Any]:
+    p = Path(path)
+    state = {
+        "path": str(p),
+        "exists": False,
+        "size_bytes": 0,
+        "mtime_ms": 0,
+    }
+    try:
+        if not p.exists():
+            return state
+        stat = p.stat()
+        state.update(
+            {
+                "exists": True,
+                "size_bytes": int(stat.st_size),
+                "mtime_ms": int(stat.st_mtime * 1000.0),
+            }
+        )
+    except Exception:
+        return state
+    return state
+
+
+def _list_dir_snapshot(path: str, *, max_entries: int = 30) -> list[dict[str, Any]]:
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        for entry in sorted(p.iterdir(), key=lambda x: x.name)[: max(1, int(max_entries))]:
+            try:
+                stat = entry.stat()
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "is_dir": entry.is_dir(),
+                        "size_bytes": int(stat.st_size),
+                        "mtime_ms": int(stat.st_mtime * 1000.0),
+                    }
+                )
+            except Exception:
+                entries.append({"name": entry.name, "is_dir": entry.is_dir(), "size_bytes": 0, "mtime_ms": 0})
+    except Exception:
+        return []
+    return entries
+
+
+def _emit_lyrics_output_diag(
+    *,
+    stage: str,
+    cut_idx: int,
+    reason: str,
+    output_path: str,
+    source_path: str,
+    log_path: str,
+) -> None:
+    if not _lyrics_stage_diag_enabled():
+        return
+    output_state = _probe_output_state(output_path)
+    source_state = _probe_output_state(source_path)
+    summary = _probe_media_summary(output_path) if output_state.get("exists") else {"path": output_path}
+    _emit_event(
+        event="lyrics_output_diag",
+        stage=stage,
+        cut_idx=cut_idx,
+        message="lyrics output diagnostics",
+        reason=reason,
+        output_path=str(output_path),
+        source_path=str(source_path),
+        log_path=str(log_path),
+        output_state=output_state,
+        source_state=source_state,
+        ffprobe_summary=summary,
+        output_dir_snapshot=_list_dir_snapshot(str(Path(output_path).parent)),
+    )
+
+
 def _handle_lyrics_stage_fallback(
     *,
     stage: str,
@@ -941,6 +1028,14 @@ def _handle_lyrics_stage_fallback(
     has_cues = int(lyrics_cues) > 0
     strict_mode = _strict_lyrics_overlay_enabled()
     fail = bool(strict_on_nonempty and has_cues and strict_mode)
+    _emit_lyrics_output_diag(
+        stage=stage,
+        cut_idx=cut_idx,
+        reason=reason,
+        output_path=output_path,
+        source_path=source_path,
+        log_path=log_path,
+    )
     _emit_event(
         event="stage_fallback",
         stage=stage,
@@ -2233,6 +2328,12 @@ def _run_to_log(
         elapsed_ms = int(round((time.monotonic() - started) * 1000.0))
         if return_code == 0:
             _EVENT_SUMMARY["stages_succeeded"] = int(_EVENT_SUMMARY.get("stages_succeeded", 0)) + 1
+            output_probe_bytes = 0
+            if output_probe_path:
+                try:
+                    output_probe_bytes = int(Path(output_probe_path).stat().st_size)
+                except Exception:
+                    output_probe_bytes = 0
             _emit_event(
                 event="stage_end",
                 stage=stage,
@@ -2242,6 +2343,8 @@ def _run_to_log(
                 duration_ms=elapsed_ms,
                 log_path=str(log_file),
                 output_probe_path=output_probe_path or "",
+                output_probe_bytes=output_probe_bytes,
+                exit_code=return_code,
             )
             return
         _EVENT_SUMMARY["stages_failed"] = int(_EVENT_SUMMARY.get("stages_failed", 0)) + 1
@@ -3028,6 +3131,14 @@ def run_once() -> int:
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
+                        )
+                        _emit_lyrics_output_diag(
+                            stage=lyrics_stage,
+                            cut_idx=i,
+                            reason="post_render",
+                            output_path=cut_lyrics_mp4,
+                            source_path=cut_base_mp4,
+                            log_path=cut_lyrics_log,
                         )
                         lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
@@ -3851,6 +3962,14 @@ def run_once() -> int:
                             retries=blender_stage_retries,
                             retry_delay_seconds=blender_retry_delay_s,
                             output_probe_path=cut_lyrics_mp4,
+                        )
+                        _emit_lyrics_output_diag(
+                            stage=lyrics_stage,
+                            cut_idx=i,
+                            reason="post_render",
+                            output_path=cut_lyrics_mp4,
+                            source_path=source_for_lyrics,
+                            log_path=cut_lyrics_log,
                         )
                         lyrics_fallback_applied = _materialize_video_fallback_output(
                             output_path=cut_lyrics_mp4,
