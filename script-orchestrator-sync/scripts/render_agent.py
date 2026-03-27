@@ -997,6 +997,7 @@ def _emit_lyrics_output_diag(
     output_state = _probe_output_state(output_path)
     source_state = _probe_output_state(source_path)
     summary = _probe_media_summary(output_path) if output_state.get("exists") else {"path": output_path}
+    log_tail = _log_tail_excerpt(log_path)
     _emit_event(
         event="lyrics_output_diag",
         stage=stage,
@@ -1006,6 +1007,7 @@ def _emit_lyrics_output_diag(
         output_path=str(output_path),
         source_path=str(source_path),
         log_path=str(log_path),
+        log_tail=log_tail,
         output_state=output_state,
         source_state=source_state,
         ffprobe_summary=summary,

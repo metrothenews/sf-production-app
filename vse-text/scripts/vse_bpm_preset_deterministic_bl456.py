@@ -641,7 +641,8 @@ def add_movie(
 ) -> bpy.types.Sequence:
     se = scene.sequence_editor
     assert se is not None
-    return se.strips.new_movie(
+    coll = _top_level_collection(se)
+    return coll.new_movie(
         name=Path(filepath).name,
         filepath=filepath,
         channel=int(channel),
@@ -658,7 +659,8 @@ def add_sound(
 ) -> bpy.types.Sequence:
     se = scene.sequence_editor
     assert se is not None
-    return se.strips.new_sound(
+    coll = _top_level_collection(se)
+    return coll.new_sound(
         name=Path(filepath).name,
         filepath=filepath,
         channel=int(channel),
@@ -759,9 +761,10 @@ def add_effect_with_input(
     """Compatibility wrapper for VSE new_effect inputs across builds."""
     se = scene.sequence_editor
     assert se is not None
+    coll = _top_level_collection(se)
     # Blender 4.5+ accepts seq1/seq2 kwargs for effect inputs.
     try:
-        st = se.strips.new_effect(
+        st = coll.new_effect(
             name=name,
             type=type_,
             channel=int(channel),
@@ -772,7 +775,7 @@ def add_effect_with_input(
         )
         return st
     except TypeError:
-        st = se.strips.new_effect(
+        st = coll.new_effect(
             name=name,
             type=type_,
             channel=int(channel),
@@ -957,7 +960,8 @@ def add_color_strip(
 ) -> bpy.types.Sequence:
     se = scene.sequence_editor
     assert se is not None
-    st = se.strips.new_effect(
+    coll = _top_level_collection(se)
+    st = coll.new_effect(
         name=str(name),
         type="COLOR",
         channel=int(channel),
@@ -998,7 +1002,8 @@ def add_text_effect(
 ) -> bpy.types.Sequence:
     se = scene.sequence_editor
     assert se is not None
-    st = se.strips.new_effect(
+    coll = _top_level_collection(se)
+    st = coll.new_effect(
         name=str(name),
         type="TEXT",
         channel=int(channel),
