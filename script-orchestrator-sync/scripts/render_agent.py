@@ -2490,6 +2490,42 @@ def _upload_failure_diagnostics(
     return written
 
 
+def _upload_failure_events_jsonl(
+    *,
+    gw: SheetsGateway,
+    control_sheet_id: str,
+    client: Any | None,
+    drive_folder_id: str,
+    run_id: str,
+    render_job_id: str,
+    campaign_id: str,
+    verify_mode: str,
+) -> int:
+    if client is None or not drive_folder_id:
+        return 0
+    events_path = _event_log_path()
+    if not events_path or not Path(events_path).exists():
+        return 0
+    created = _utc_now_iso()
+    row = _build_output_row_from_file(
+        run_id=run_id,
+        render_job_id=render_job_id,
+        campaign_id=campaign_id,
+        artifact_type="pipeline_events_jsonl",
+        file_path=events_path,
+        created_utc=created,
+    )
+    out = _upload_confirm_record_and_delete(
+        gw=gw,
+        control_sheet_id=control_sheet_id,
+        client=client,
+        artifact_row=row,
+        drive_folder_id=drive_folder_id,
+        verify_mode=verify_mode,
+    )
+    return 1 if out else 0
+
+
 def _load_json_file(path: str) -> dict[str, Any]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -4421,6 +4457,31 @@ def run_once() -> int:
             exception=err_text,
             summary=dict(_EVENT_SUMMARY),
         )
+        if pipeline_paths_for_cleanup is not None:
+            try:
+                uploaded = _upload_failure_events_jsonl(
+                    gw=gw,
+                    control_sheet_id=control_sheet_id,
+                    client=pipeline_diag_client,
+                    drive_folder_id=pipeline_diag_drive_folder_id,
+                    run_id=run_id,
+                    render_job_id=render_job_id,
+                    campaign_id=pipeline_diag_campaign_id,
+                    verify_mode=pipeline_diag_verify_mode,
+                )
+                if uploaded > 0:
+                    run_row["artifacts_written"] = int(run_row.get("artifacts_written") or 0) + int(uploaded)
+                    run_row["updated_utc"] = _utc_now_iso()
+                    upsert_render_run(gw, control_sheet_id, run_row)
+            except Exception as diag_exc:
+                _emit_event(
+                    event="failure_events_upload_fail",
+                    stage="forensics",
+                    severity="warning",
+                    code=_classify_error_code(str(diag_exc)),
+                    message="failure events upload failed",
+                    exception=str(diag_exc),
+                )
         if pipeline_paths_for_cleanup is not None and _pipeline_forensics_on_failure():
             summary_path, bundle_path = _build_forensics_bundle(
                 run_id=run_id,
