@@ -1,5 +1,7 @@
 # SF Production — sheet-driven video render pipeline
 
+**A programmatic video engine: structured job in, finished short-form edits out, with a human-in-the-loop control plane.**
+
 An automated pipeline that turns a row in a Google Sheet into finished, beat-synced music-video edits. A producer fills in a job (song, footage folder, BPM, aspect ratio, text style). A render agent leases the job, pulls the footage from Google Drive, cuts and stitches it in **Blender's Video Sequence Editor** on the beat, burns in word-by-word lyric captions from an SRT, uploads the renders back to Drive and writes status and output links to the sheet.
 
 It was built to make short-form video for an independent music release without hand-editing each cut.
@@ -31,6 +33,17 @@ flowchart LR
 - **Deterministic rendering.** Frame timing uses integer milliseconds (`frame = 1 + floor((ms*fps + 500)/1000)`) with end-exclusive ranges, so captions never drift or overlap. Seeded randomness makes edits reproducible.
 - **Preset-driven creative control.** Cut style and caption look are data (Python preset dicts merged over defaults), so a new look doesn't need changes to the pipeline.
 - **Production-minded ops.** Docker Compose for dev (hot reload) and prod, a VM deploy script with a health-check gate, fail-fast startup checks for credentials and render binaries, and `make` targets for preflight, bootstrap and smoke tests.
+
+## Applications at scale
+
+The pipeline is a general **programmatic video engine**, not a one-off script. The same architecture covers:
+
+- **Creative automation for short-form video.** One template plus a folder of footage yields any number of distinct, on-beat edits. That's the workload behind ad-creative testing, UGC-style campaigns and catalog marketing, where volume and variation matter more than a single hero cut.
+- **An execution layer for generative media.** Today the inputs are camera footage and human-written lyrics. The job contract doesn't care where they come from: clips from a text-to-video model and captions from an LLM or speech-to-text model drop into the same stitch → caption → encode stages. Leasing, retries and the run ledger are the reliability layer that non-deterministic models need around them.
+- **Agent-operable production.** Jobs are structured rows and an HTTP API, so an AI agent can queue, monitor and requeue renders the same way a producer does, with a human approving in the sheet.
+- **Localization and reformatting.** Swapping the SRT gives a new language; swapping the canvas gives 9:16 or 16:9. Both are data changes, not edits.
+
+**What it demonstrates:** distributed job orchestration, idempotency and state machines, deterministic media processing, human-in-the-loop workflow design, containerized deployment, test discipline (118 tests).
 
 ## Running it
 
