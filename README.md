@@ -1,6 +1,14 @@
 # SF Production — sheet-driven video render pipeline
 
-**A programmatic video engine: structured job in, finished short-form edits out, with a human-in-the-loop control plane.**
+**Batch video production infrastructure: a producer queues jobs, the pipeline renders consistent, on-brief edits at volume, and a person stays in control of what ships.**
+
+| Production need | How this handles it |
+|---|---|
+| High-volume runs with consistent quality | A job queue with leasing, so several render agents work concurrent streams without duplicating or dropping work |
+| Reproducible output | Every edit is seeded and preset-driven: the same seed, inputs and preset give the same result, so a look can be re-run or tweaked one parameter at a time |
+| A defined visual language | Cut rhythm and caption typography (font, size, tracking, line spacing, alignment, safe margins, per-word layout, pixelate treatment) live in versioned preset files, not in someone's head |
+| Local and cloud execution | Runs on a workstation or in a container on a cloud VM from the same code, with fail-fast preflight checks |
+| Organized delivery | Renders upload to the right Drive folder and are indexed back to the job with status and links |
 
 An automated pipeline that turns a row in a Google Sheet into finished, beat-synced music-video edits. A producer fills in a job (song, footage folder, BPM, aspect ratio, text style). A render agent leases the job, pulls the footage from Google Drive, cuts and stitches it in **Blender's Video Sequence Editor** on the beat, burns in word-by-word lyric captions from an SRT, uploads the renders back to Drive and writes status and output links to the sheet.
 
