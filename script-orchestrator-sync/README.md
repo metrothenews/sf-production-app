@@ -251,8 +251,8 @@ Optional env vars:
 - `CONFIG_SHEET_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
 - `CONFIG_TAB` (default: `Sheet1`)
 - `CONFIG_RANGE` (default: `A1:AZ2`)
-- `CLIPS_LIBRARY_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
-- `OUTPUT_PARENT_FOLDER_ID` (default: `YOUR_GOOGLE_SHEET_ID`)
+- `CLIPS_LIBRARY_FOLDER_ID` (default: `YOUR_DRIVE_FOLDER_ID`)
+- `OUTPUT_PARENT_FOLDER_ID` (default: `YOUR_DRIVE_FOLDER_ID`)
 - `ASSETS_FOLDER_ID` (optional folder used for filename->Drive id lookup)
 
 ## One-Command Batch Run (Compile + Queue Drain + Progress)
@@ -337,7 +337,7 @@ Notes:
 - Collection toggles are read from config keys matching `V Collection N` (for example:
   `V Collection 1`, `V Collection 2`, `V Collection 3`, `V Collection 4`).
 - Each enabled collection resolves to its own folder under `CLIPS_LIBRARY_FOLDER_ID` (default root:
-  `YOUR_GOOGLE_SHEET_ID`), by matching direct subfolder names like:
+  `YOUR_DRIVE_FOLDER_ID`), by matching direct subfolder names like:
   `V Collection N` or `Collection N`.
 - Optional explicit folder-id columns are supported and take precedence, for example:
   `V Collection 2 Folder ID`.
@@ -384,7 +384,7 @@ Options:
 - `--smoke`: alias for `--limit 1`
 
 Drive operator notes:
-- Output folder ID: `YOUR_GOOGLE_SHEET_ID`
+- Output folder ID: `YOUR_DRIVE_FOLDER_ID`
 - Share input files/folders with proxy service account:
   `drive-cdn-proxy@drive-cdn-proxy.iam.gserviceaccount.com`
 - Proxy test:
@@ -403,7 +403,7 @@ PYTHONPATH=src .venv_local/bin/python scripts/seed_one_render_job.py \
   --status queued \
   --select-mode shuffle_seeded \
   --select-seed 12345 \
-  --output-folder-id YOUR_GOOGLE_SHEET_ID
+  --output-folder-id YOUR_DRIVE_FOLDER_ID
 ```
 
 Permissions reminder:
