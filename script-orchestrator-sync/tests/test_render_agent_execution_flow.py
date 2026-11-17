@@ -101,7 +101,7 @@ def test_run_selected_job_folder_only_failure_includes_auth_diag(monkeypatch, tm
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(run_mod, "ensure_folder_readable", lambda folder_id: (_ for _ in ()).throw(RuntimeError("permission denied")))
     monkeypatch.setattr(run_mod, "describe_google_auth", lambda: {"mode": "adc", "error": "invalid_grant"})
-    job = {"render_job_id": "job_folder_only", "target_count": "1", "source_folder_ids": "folder1", "output_folder_id": "out"}
+    job = {"render_job_id": "job_folder_only", "target_count": "1", "source_folder_ids": "folderAAA1234", "output_folder_id": "out"}
     try:
         run_mod._run_selected_job(job, leased=False)
         assert False, "expected RuntimeError"
@@ -135,10 +135,10 @@ def test_run_selected_job_mixed_sources_allow_no_listing_fallback(monkeypatch, t
     job = {
         "render_job_id": "job_mixed",
         "target_count": "1",
-        "source_folder_ids": "folder1",
-        "source_file_ids": "f1,f2",
+        "source_folder_ids": "folderAAA1234",
+        "source_file_ids": "fileAAA12345,fileBBB12345",
         "output_folder_id": "out",
     }
     rc = run_mod._run_selected_job(job, leased=False)
     assert rc == 0
-    assert seen["args"] == ([], ["f1", "f2"])
+    assert seen["args"] == ([], ["fileAAA12345", "fileBBB12345"])
