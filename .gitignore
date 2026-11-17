@@ -14,3 +14,16 @@ __pycache__/
 
 # Local runtime artifacts
 work/
+
+# Rendered media, source audio and render logs (bring your own)
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.log
+*.bak*
+
+# Local env files (examples are committed)
+.env
+.env.*
+!.env*.example
